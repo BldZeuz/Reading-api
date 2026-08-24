@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -7,48 +8,80 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
+import wave
+
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-import librosa
 import numpy as np
-import soundfile as sf
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+)
+
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================
 
-APP_NAME = "Wav2Vec2 Reading Analysis API"
+APP_NAME = "Vosk Reading Analysis API"
 
-# Wav2Vec2 expects 16 kHz audio
 SAMPLE_RATE = 16_000
 
-# Default English Wav2Vec2 model
-MODEL_ID = os.getenv(
-    "WAV2VEC2_MODEL",
-    "facebook/wav2vec2-base-960h"
+MODEL_PATH = Path(
+    os.getenv(
+        "VOSK_MODEL_PATH",
+        "/opt/vosk-model"
+    )
 )
 
-# Upload limits
 MAX_UPLOAD_MB = float(
-    os.getenv("MAX_UPLOAD_MB", "25")
+    os.getenv(
+        "MAX_UPLOAD_MB",
+        "15"
+    )
 )
 
 MAX_AUDIO_SECONDS = float(
-    os.getenv("MAX_AUDIO_SECONDS", "300")
+    os.getenv(
+        "MAX_AUDIO_SECONDS",
+        "60"
+    )
 )
 
-# Speaking speed target
 TARGET_WPM_MIN = float(
-    os.getenv("TARGET_WPM_MIN", "110")
+    os.getenv(
+        "TARGET_WPM_MIN",
+        "110"
+    )
 )
 
 TARGET_WPM_MAX = float(
-    os.getenv("TARGET_WPM_MAX", "180")
+    os.getenv(
+        "TARGET_WPM_MAX",
+        "180"
+    )
+)
+
+PRELOAD_MODEL = (
+    os.getenv(
+        "PRELOAD_MODEL",
+        "1"
+    ).lower()
+    not in {
+        "0",
+        "false",
+        "no"
+    }
 )
 
 
@@ -56,39 +89,8 @@ TARGET_WPM_MAX = float(
 # GLOBAL MODEL
 # ============================================================
 
-_ASR_PIPELINE: Any | None = None
-
+_VOSK_MODEL: Any | None = None
 _MODEL_LOCK = threading.Lock()
-_INFERENCE_LOCK = threading.Lock()
-
-
-# ============================================================
-# FASTAPI
-# ============================================================
-
-app = FastAPI(
-    title=APP_NAME,
-    version="1.0.0"
-)
-
-
-# ============================================================
-# CORS
-# ============================================================
-
-allow_origins = [
-    x.strip()
-    for x in os.getenv("ALLOW_ORIGINS", "*").split(",")
-    if x.strip()
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allow_origins,
-    allow_credentials=False if allow_origins == ["*"] else True,
-    allow_methods=["GET", "POST"],
-    allow_headers=["*"],
-)
 
 
 # ============================================================
@@ -100,7 +102,14 @@ def clamp(
     low: float = 0.0,
     high: float = 100.0
 ) -> float:
-    return max(low, min(high, value))
+
+    return max(
+        low,
+        min(
+            high,
+            value
+        )
+    )
 
 
 def round_or_none(
@@ -111,42 +120,49 @@ def round_or_none(
     if value is None:
         return None
 
-    if not math.isfinite(value):
+    if not math.isfinite(
+        float(value)
+    ):
         return None
 
-    return round(float(value), digits)
+    return round(
+        float(value),
+        digits
+    )
 
 
 # ============================================================
 # TEXT NORMALIZATION
 # ============================================================
 
-def normalize_text(text: str) -> str:
+def normalize_text(
+    text: str
+) -> str:
 
-    text = text.lower()
+    text = (
+        text
+        .lower()
+        .replace(
+            "’",
+            "'"
+        )
+    )
 
-    # Normalize curly apostrophe
-    text = text.replace("’", "'")
-
-    # Remove punctuation
     text = re.sub(
         r"[^a-z0-9']+",
         " ",
         text
     )
 
-    # Normalize spaces
-    text = re.sub(
+    return re.sub(
         r"\s+",
         " ",
         text
     ).strip()
 
-    return text
-
 
 # ============================================================
-# WORD ACCURACY / WER
+# WORD ALIGNMENT / ACCURACY
 # ============================================================
 
 def align_words(
@@ -154,72 +170,118 @@ def align_words(
     spoken_text: str
 ) -> dict[str, Any]:
 
-    reference_words = normalize_text(
-        reference_text
-    ).split()
+    reference_words = (
+        normalize_text(
+            reference_text
+        ).split()
+    )
 
-    spoken_words = normalize_text(
-        spoken_text
-    ).split()
+    spoken_words = (
+        normalize_text(
+            spoken_text
+        ).split()
+    )
 
-    n = len(reference_words)
-    m = len(spoken_words)
+    n = len(
+        reference_words
+    )
 
-    # Dynamic programming table
+    m = len(
+        spoken_words
+    )
+
+
     dp = [
         [0] * (m + 1)
         for _ in range(n + 1)
     ]
 
-    back: list[list[str | None]] = [
+    back: list[
+        list[str | None]
+    ] = [
         [None] * (m + 1)
         for _ in range(n + 1)
     ]
 
-    # Initial deletion costs
-    for i in range(1, n + 1):
+
+    for i in range(
+        1,
+        n + 1
+    ):
 
         dp[i][0] = i
-        back[i][0] = "deletion"
 
-    # Initial insertion costs
-    for j in range(1, m + 1):
+        back[i][0] = (
+            "deletion"
+        )
+
+
+    for j in range(
+        1,
+        m + 1
+    ):
 
         dp[0][j] = j
-        back[0][j] = "insertion"
+
+        back[0][j] = (
+            "insertion"
+        )
+
 
     priority = {
+
         "correct": 0,
+
         "substitution": 1,
+
         "deletion": 2,
+
         "insertion": 3,
+
     }
 
-    # Build alignment table
-    for i in range(1, n + 1):
 
-        for j in range(1, m + 1):
+    # ========================================================
+    # BUILD EDIT DISTANCE TABLE
+    # ========================================================
+
+    for i in range(
+        1,
+        n + 1
+    ):
+
+        for j in range(
+            1,
+            m + 1
+        ):
+
+            candidates: list[
+                tuple[int, str]
+            ] = []
+
 
             if (
                 reference_words[i - 1]
-                == spoken_words[j - 1]
+                ==
+                spoken_words[j - 1]
             ):
 
-                candidates = [
+                candidates.append(
                     (
                         dp[i - 1][j - 1],
                         "correct"
                     )
-                ]
+                )
 
             else:
 
-                candidates = [
+                candidates.append(
                     (
                         dp[i - 1][j - 1] + 1,
                         "substitution"
                     )
-                ]
+                )
+
 
             candidates.extend(
                 [
@@ -227,6 +289,7 @@ def align_words(
                         dp[i - 1][j] + 1,
                         "deletion"
                     ),
+
                     (
                         dp[i][j - 1] + 1,
                         "insertion"
@@ -234,88 +297,133 @@ def align_words(
                 ]
             )
 
-            best_cost, best_operation = min(
+
+            cost, operation = min(
+
                 candidates,
+
                 key=lambda x: (
                     x[0],
                     priority[x[1]]
                 )
             )
 
-            dp[i][j] = best_cost
-            back[i][j] = best_operation
+
+            dp[i][j] = cost
+
+            back[i][j] = operation
 
 
     # ========================================================
-    # BACKTRACK ALIGNMENT
+    # BACKTRACK
     # ========================================================
 
     i = n
     j = m
 
-    operations: list[
-        dict[str, str | None]
-    ] = []
 
     counts = {
+
         "correct": 0,
+
         "substitution": 0,
+
         "deletion": 0,
+
         "insertion": 0,
+
     }
 
-    while i > 0 or j > 0:
 
-        operation = back[i][j]
+    operations: list[
+        dict[
+            str,
+            str | None
+        ]
+    ] = []
+
+
+    while (
+        i > 0
+        or
+        j > 0
+    ):
+
+        operation = (
+            back[i][j]
+        )
+
 
         if operation == "correct":
 
             operations.append(
                 {
                     "reference":
-                        reference_words[i - 1],
+                        reference_words[
+                            i - 1
+                        ],
 
                     "spoken":
-                        spoken_words[j - 1],
+                        spoken_words[
+                            j - 1
+                        ],
 
                     "status":
                         operation,
                 }
             )
 
-            counts[operation] += 1
+            counts[
+                operation
+            ] += 1
 
             i -= 1
             j -= 1
 
 
-        elif operation == "substitution":
+        elif (
+            operation
+            ==
+            "substitution"
+        ):
 
             operations.append(
                 {
                     "reference":
-                        reference_words[i - 1],
+                        reference_words[
+                            i - 1
+                        ],
 
                     "spoken":
-                        spoken_words[j - 1],
+                        spoken_words[
+                            j - 1
+                        ],
 
                     "status":
                         operation,
                 }
             )
 
-            counts[operation] += 1
+            counts[
+                operation
+            ] += 1
 
             i -= 1
             j -= 1
 
 
-        elif operation == "deletion":
+        elif (
+            operation
+            ==
+            "deletion"
+        ):
 
             operations.append(
                 {
                     "reference":
-                        reference_words[i - 1],
+                        reference_words[
+                            i - 1
+                        ],
 
                     "spoken":
                         None,
@@ -325,12 +433,18 @@ def align_words(
                 }
             )
 
-            counts[operation] += 1
+            counts[
+                operation
+            ] += 1
 
             i -= 1
 
 
-        elif operation == "insertion":
+        elif (
+            operation
+            ==
+            "insertion"
+        ):
 
             operations.append(
                 {
@@ -338,41 +452,53 @@ def align_words(
                         None,
 
                     "spoken":
-                        spoken_words[j - 1],
+                        spoken_words[
+                            j - 1
+                        ],
 
                     "status":
                         operation,
                 }
             )
 
-            counts[operation] += 1
+            counts[
+                operation
+            ] += 1
 
             j -= 1
 
         else:
+
             break
 
 
     operations.reverse()
 
 
-    # ========================================================
-    # CALCULATE WER
-    # ========================================================
-
     errors = (
         counts["substitution"]
-        + counts["deletion"]
-        + counts["insertion"]
+        +
+        counts["deletion"]
+        +
+        counts["insertion"]
     )
 
-    if n > 0:
 
-        wer = errors / n
+    if n:
+
+        wer = (
+            errors
+            /
+            n
+        )
 
         accuracy = clamp(
-            100.0 * (
-                1.0 - wer
+            100.0
+            *
+            (
+                1.0
+                -
+                wer
             )
         )
 
@@ -391,16 +517,24 @@ def align_words(
             m,
 
         "correct":
-            counts["correct"],
+            counts[
+                "correct"
+            ],
 
         "substitutions":
-            counts["substitution"],
+            counts[
+                "substitution"
+            ],
 
         "deletions":
-            counts["deletion"],
+            counts[
+                "deletion"
+            ],
 
         "insertions":
-            counts["insertion"],
+            counts[
+                "insertion"
+            ],
 
         "wer":
             round_or_none(
@@ -419,7 +553,7 @@ def align_words(
 
 
 # ============================================================
-# GENERIC RANGE SCORER
+# GENERIC SCORE
 # ============================================================
 
 def _range_score(
@@ -430,11 +564,17 @@ def _range_score(
     outer_high: float
 ) -> float:
 
-    # Perfect range
-    if ideal_low <= value <= ideal_high:
+    if (
+        ideal_low
+        <=
+        value
+        <=
+        ideal_high
+    ):
+
         return 100.0
 
-    # Too low
+
     if value < ideal_low:
 
         if value <= outer_low:
@@ -442,23 +582,47 @@ def _range_score(
 
         return (
             100.0
-            * (value - outer_low)
-            / (ideal_low - outer_low)
+            *
+            (
+                value
+                -
+                outer_low
+            )
+            /
+            max(
+                ideal_low
+                -
+                outer_low,
+                1e-9
+            )
         )
 
-    # Too high
+
     if value >= outer_high:
+
         return 0.0
+
 
     return (
         100.0
-        * (outer_high - value)
-        / (outer_high - ideal_high)
+        *
+        (
+            outer_high
+            -
+            value
+        )
+        /
+        max(
+            outer_high
+            -
+            ideal_high,
+            1e-9
+        )
     )
 
 
 # ============================================================
-# SPEAKING SPEED
+# SPEED
 # ============================================================
 
 def calculate_speed(
@@ -471,8 +635,10 @@ def calculate_speed(
 
         gross_wpm = (
             word_count
-            * 60.0
-            / total_seconds
+            *
+            60.0
+            /
+            total_seconds
         )
 
     else:
@@ -480,12 +646,18 @@ def calculate_speed(
         gross_wpm = 0.0
 
 
-    if active_speech_seconds > 0:
+    if (
+        active_speech_seconds
+        >
+        0
+    ):
 
         articulation_wpm = (
             word_count
-            * 60.0
-            / active_speech_seconds
+            *
+            60.0
+            /
+            active_speech_seconds
         )
 
     else:
@@ -494,23 +666,37 @@ def calculate_speed(
 
 
     score = _range_score(
+
         gross_wpm,
 
         TARGET_WPM_MIN,
+
         TARGET_WPM_MAX,
 
         50.0,
+
         260.0
+
     )
 
 
-    if gross_wpm < TARGET_WPM_MIN:
+    if (
+        gross_wpm
+        <
+        TARGET_WPM_MIN
+    ):
 
         label = "slow"
 
-    elif gross_wpm > TARGET_WPM_MAX:
+
+    elif (
+        gross_wpm
+        >
+        TARGET_WPM_MAX
+    ):
 
         label = "fast"
+
 
     else:
 
@@ -520,7 +706,9 @@ def calculate_speed(
     return {
 
         "word_count":
-            int(word_count),
+            int(
+                word_count
+            ),
 
         "gross_wpm":
             round_or_none(
@@ -548,7 +736,613 @@ def calculate_speed(
 
 
 # ============================================================
-# PROSODY ANALYSIS
+# FFMPEG
+# ============================================================
+
+def ensure_ffmpeg() -> None:
+
+    if (
+        shutil.which(
+            "ffmpeg"
+        )
+        is None
+    ):
+
+        raise RuntimeError(
+
+            "FFmpeg was not found. "
+            "Use the included Dockerfile "
+            "or install FFmpeg."
+
+        )
+
+
+def convert_to_wav(
+    input_path: str | Path,
+    output_path: str | Path
+) -> None:
+
+    ensure_ffmpeg()
+
+
+    command = [
+
+        "ffmpeg",
+
+        "-hide_banner",
+
+        "-loglevel",
+        "error",
+
+        "-y",
+
+        "-i",
+        str(
+            input_path
+        ),
+
+        # Ignore video streams
+        "-vn",
+
+        # Mono
+        "-ac",
+        "1",
+
+        # 16 kHz
+        "-ar",
+        str(
+            SAMPLE_RATE
+        ),
+
+        # 16-bit PCM WAV
+        "-c:a",
+        "pcm_s16le",
+
+        str(
+            output_path
+        ),
+    ]
+
+
+    result = subprocess.run(
+
+        command,
+
+        stdout=
+            subprocess.PIPE,
+
+        stderr=
+            subprocess.PIPE,
+
+        text=True,
+
+        timeout=45
+
+    )
+
+
+    if (
+        result.returncode
+        !=
+        0
+    ):
+
+        message = (
+
+            result.stderr
+
+            or
+
+            "FFmpeg could not decode "
+            "the uploaded audio."
+
+        ).strip()
+
+
+        raise ValueError(
+            message[-1200:]
+        )
+
+
+# ============================================================
+# WAV READER
+# ============================================================
+
+def load_pcm16_wav(
+    wav_path: str | Path
+) -> tuple[
+    np.ndarray,
+    bytes,
+    float
+]:
+
+    with wave.open(
+        str(
+            wav_path
+        ),
+        "rb"
+    ) as wf:
+
+        if (
+            wf.getnchannels()
+            !=
+            1
+
+            or
+
+            wf.getsampwidth()
+            !=
+            2
+
+            or
+
+            wf.getcomptype()
+            !=
+            "NONE"
+        ):
+
+            raise ValueError(
+
+                "Normalized WAV must be "
+                "mono 16-bit PCM."
+
+            )
+
+
+        if (
+            wf.getframerate()
+            !=
+            SAMPLE_RATE
+        ):
+
+            raise ValueError(
+
+                f"Expected "
+                f"{SAMPLE_RATE} Hz WAV, "
+                f"got "
+                f"{wf.getframerate()} Hz."
+
+            )
+
+
+        frames = wf.readframes(
+            wf.getnframes()
+        )
+
+
+    samples_i16 = np.frombuffer(
+
+        frames,
+
+        dtype="<i2"
+
+    )
+
+
+    audio = (
+
+        samples_i16
+        .astype(
+            np.float32
+        )
+
+        /
+
+        32768.0
+
+    )
+
+
+    duration = (
+
+        len(
+            audio
+        )
+
+        /
+
+        float(
+            SAMPLE_RATE
+        )
+
+    )
+
+
+    if duration <= 0.05:
+
+        raise ValueError(
+            "Audio is too short to analyze."
+        )
+
+
+    if (
+        duration
+        >
+        MAX_AUDIO_SECONDS
+    ):
+
+        raise ValueError(
+
+            f"Audio is "
+            f"{duration:.1f}s; "
+            f"maximum allowed is "
+            f"{MAX_AUDIO_SECONDS:.0f}s."
+
+        )
+
+
+    if (
+
+        audio.size == 0
+
+        or
+
+        float(
+            np.max(
+                np.abs(
+                    audio
+                )
+            )
+        )
+        <
+        1e-5
+
+    ):
+
+        raise ValueError(
+
+            "Audio is silent "
+            "or nearly silent."
+
+        )
+
+
+    return (
+        audio,
+        frames,
+        duration
+    )
+
+
+# ============================================================
+# FAST RMS
+# ============================================================
+
+def _frame_rms(
+    audio: np.ndarray,
+    frame_length: int = 320,
+    hop_length: int = 160
+) -> tuple[
+    np.ndarray,
+    np.ndarray
+]:
+
+    if (
+        len(audio)
+        <
+        frame_length
+    ):
+
+        padded = np.pad(
+
+            audio,
+
+            (
+                0,
+                frame_length
+                -
+                len(audio)
+            )
+
+        )
+
+
+        return (
+
+            np.array(
+                [
+                    float(
+                        np.sqrt(
+                            np.mean(
+                                padded
+                                *
+                                padded
+                            )
+                            +
+                            1e-12
+                        )
+                    )
+                ]
+            ),
+
+            np.array(
+                [0],
+                dtype=np.int64
+            )
+
+        )
+
+
+    starts = np.arange(
+
+        0,
+
+        len(audio)
+        -
+        frame_length
+        +
+        1,
+
+        hop_length,
+
+        dtype=np.int64
+
+    )
+
+
+    rms = np.empty(
+
+        len(
+            starts
+        ),
+
+        dtype=np.float32
+
+    )
+
+
+    for (
+        idx,
+        start
+    ) in enumerate(
+        starts
+    ):
+
+        frame = audio[
+
+            start
+            :
+            start
+            +
+            frame_length
+
+        ]
+
+
+        rms[idx] = float(
+
+            np.sqrt(
+
+                np.mean(
+                    frame
+                    *
+                    frame
+                )
+
+                +
+
+                1e-12
+
+            )
+
+        )
+
+
+    return (
+        rms,
+        starts
+    )
+
+
+# ============================================================
+# LIGHTWEIGHT PITCH ESTIMATOR
+# ============================================================
+
+def _estimate_pitch_hz(
+    frame: np.ndarray,
+    sr: int = SAMPLE_RATE
+) -> float | None:
+
+    # Downsample from 16kHz -> 8kHz.
+    # This makes autocorrelation much cheaper.
+
+    x = np.asarray(
+
+        frame[::2],
+
+        dtype=np.float32
+
+    )
+
+
+    ds_sr = (
+        sr
+        //
+        2
+    )
+
+
+    if len(x) < 160:
+
+        return None
+
+
+    # Remove DC offset
+
+    x = (
+        x
+        -
+        float(
+            np.mean(
+                x
+            )
+        )
+    )
+
+
+    peak = float(
+
+        np.max(
+            np.abs(
+                x
+            )
+        )
+
+    )
+
+
+    if peak < 1e-4:
+
+        return None
+
+
+    # Window signal
+
+    x *= (
+        np.hanning(
+            len(
+                x
+            )
+        )
+        .astype(
+            np.float32
+        )
+    )
+
+
+    # Autocorrelation
+
+    corr = np.correlate(
+
+        x,
+
+        x,
+
+        mode="full"
+
+    )[
+
+        len(x)
+        -
+        1
+        :
+
+    ]
+
+
+    if (
+
+        corr.size == 0
+
+        or
+
+        corr[0] <= 1e-9
+
+    ):
+
+        return None
+
+
+    min_hz = 65.0
+
+    max_hz = 400.0
+
+
+    min_lag = max(
+
+        1,
+
+        int(
+            ds_sr
+            /
+            max_hz
+        )
+
+    )
+
+
+    max_lag = min(
+
+        len(corr)
+        -
+        1,
+
+        int(
+            ds_sr
+            /
+            min_hz
+        )
+
+    )
+
+
+    if (
+        max_lag
+        <=
+        min_lag
+    ):
+
+        return None
+
+
+    segment = corr[
+
+        min_lag
+        :
+        max_lag
+        +
+        1
+
+    ]
+
+
+    lag = (
+
+        min_lag
+
+        +
+
+        int(
+            np.argmax(
+                segment
+            )
+        )
+
+    )
+
+
+    confidence = float(
+
+        corr[
+            lag
+        ]
+
+        /
+
+        max(
+            corr[0],
+            1e-9
+        )
+
+    )
+
+
+    if confidence < 0.28:
+
+        return None
+
+
+    return float(
+
+        ds_sr
+        /
+        lag
+
+    )
+
+
+# ============================================================
+# LIGHTWEIGHT PROSODY
 # ============================================================
 
 def calculate_acoustics(
@@ -556,85 +1350,133 @@ def calculate_acoustics(
     sr: int = SAMPLE_RATE
 ) -> dict[str, Any]:
 
-    # Convert stereo -> mono if somehow needed
-    if audio.ndim > 1:
-
-        audio = np.mean(
-            audio,
-            axis=1
-        )
-
-    audio = np.asarray(
-        audio,
-        dtype=np.float32
-    )
-
-
-    if audio.size == 0:
-
-        raise ValueError(
-            "Audio contains no samples."
-        )
-
-
     total_seconds = (
-        len(audio)
-        / float(sr)
+
+        len(
+            audio
+        )
+
+        /
+
+        float(
+            sr
+        )
+
     )
 
 
-    if total_seconds <= 0.05:
+    rms, starts = (
+        _frame_rms(
+            audio
+        )
+    )
+
+
+    max_rms = (
+
+        float(
+            np.max(
+                rms
+            )
+        )
+
+        if rms.size
+
+        else 0.0
+
+    )
+
+
+    if max_rms <= 1e-7:
 
         raise ValueError(
-            "Audio is too short to analyze."
+
+            "Audio is silent "
+            "or nearly silent."
+
         )
 
 
-    # ========================================================
-    # SILENCE CHECK
-    # ========================================================
+    # About -24dB relative to
+    # loudest short-time RMS frame.
 
-    peak = float(
-        np.max(
-            np.abs(audio)
-        )
+    threshold = max(
+
+        max_rms
+        *
+        0.063,
+
+        0.002
+
     )
 
-    if peak < 1e-5:
+
+    speech_mask = (
+        rms
+        >=
+        threshold
+    )
+
+
+    if not np.any(
+        speech_mask
+    ):
 
         raise ValueError(
-            "Audio is silent or nearly silent."
+
+            "No speech-like audio "
+            "was detected."
+
         )
 
 
-    # ========================================================
-    # SPEECH / SILENCE SEGMENTATION
-    # ========================================================
+    hop_seconds = (
 
-    intervals = librosa.effects.split(
+        160.0
+        /
+        sr
 
-        audio,
-
-        top_db=35,
-
-        # Smaller window helps detect normal speech pauses
-        frame_length=1024,
-
-        hop_length=256
     )
 
 
-    active_samples = int(
-        sum(
-            int(end) - int(start)
-            for start, end in intervals
+    first_speech = int(
+
+        np.argmax(
+            speech_mask
         )
+
     )
 
 
-    active_seconds = (
-        active_samples
-        / float(sr)
+    last_speech = (
+
+        len(
+            speech_mask
+        )
+
+        -
+        1
+
+        -
+
+        int(
+            np.argmax(
+                speech_mask[::-1]
+            )
+        )
+
+    )
+
+
+    active_speech_seconds = float(
+
+        np.sum(
+            speech_mask
+        )
+
+        *
+        hop_seconds
+
     )
 
 
@@ -642,267 +1484,365 @@ def calculate_acoustics(
     # PAUSES
     # ========================================================
 
-    pause_durations: list[float] = []
+    pause_count = 0
+
+    pause_seconds = 0.0
 
 
-    if len(intervals) > 1:
+    min_pause_frames = max(
 
-        for k in range(
-            len(intervals) - 1
-        ):
+        1,
 
-            gap = (
-                int(
-                    intervals[k + 1][0]
-                )
-
-                - int(
-                    intervals[k][1]
-                )
-            ) / float(sr)
-
-
-            # Ignore extremely tiny gaps
-            if gap >= 0.15:
-
-                pause_durations.append(
-                    gap
-                )
-
-
-    internal_pause_seconds = float(
-        sum(
-            pause_durations
+        int(
+            round(
+                0.15
+                /
+                hop_seconds
+            )
         )
+
     )
 
 
-    if total_seconds:
-
-        pause_ratio = (
-            internal_pause_seconds
-            / total_seconds
-        )
-
-    else:
-
-        pause_ratio = 0.0
+    run = 0
 
 
-    # ========================================================
-    # ENERGY / LOUDNESS
-    # ========================================================
+    for flag in speech_mask[
 
-    rms = librosa.feature.rms(
+        first_speech
+        :
+        last_speech
+        +
+        1
 
-        y=audio,
+    ]:
 
-        frame_length=2048,
+        if not flag:
 
-        hop_length=512
-
-    )[0]
+            run += 1
 
 
-    if rms.size:
+        else:
 
-        threshold = max(
+            if (
+                run
+                >=
+                min_pause_frames
+            ):
 
-            float(
-                np.max(rms)
-            ) * 0.08,
+                pause_count += 1
 
-            1e-6
-        )
+                pause_seconds += (
 
-        voiced_rms = rms[
-            rms >= threshold
-        ]
+                    run
+                    *
+                    hop_seconds
 
-    else:
+                )
 
-        voiced_rms = np.array(
-            [],
-            dtype=np.float32
-        )
+
+            run = 0
 
 
     if (
-        voiced_rms.size >= 2
+        run
+        >=
+        min_pause_frames
+    ):
 
-        and float(
+        pause_count += 1
+
+        pause_seconds += (
+
+            run
+            *
+            hop_seconds
+
+        )
+
+
+    pause_ratio = (
+
+        pause_seconds
+        /
+        total_seconds
+
+        if total_seconds > 0
+
+        else 0.0
+
+    )
+
+
+    # ========================================================
+    # ENERGY VARIATION
+    # ========================================================
+
+    voiced_rms = (
+        rms[
+            speech_mask
+        ]
+    )
+
+
+    energy_mean = (
+
+        float(
             np.mean(
                 voiced_rms
             )
-        ) > 0
+        )
+
+        if voiced_rms.size
+
+        else 0.0
+
+    )
+
+
+    energy_cv = (
+
+        float(
+            np.std(
+                voiced_rms
+            )
+            /
+            energy_mean
+        )
+
+        if energy_mean > 1e-9
+
+        else 0.0
+
+    )
+
+
+    # ========================================================
+    # PITCH
+    # ========================================================
+
+    pitch_frame_length = int(
+
+        0.04
+        *
+        sr
+
+    )
+
+
+    candidate_starts = (
+
+        starts[
+            speech_mask
+        ]
+
+    )
+
+
+    candidate_starts = (
+
+        candidate_starts[
+
+            candidate_starts
+            +
+            pitch_frame_length
+            <=
+            len(
+                audio
+            )
+
+        ]
+
+    )
+
+
+    # Prevent long audio from
+    # creating excessive work.
+
+    if (
+        len(
+            candidate_starts
+        )
+        >
+        120
     ):
 
-        energy_cv = float(
+        indices = np.linspace(
+
+            0,
+
+            len(
+                candidate_starts
+            )
+            -
+            1,
+
+            120,
+
+            dtype=np.int64
+
+        )
+
+
+        candidate_starts = (
+
+            candidate_starts[
+                indices
+            ]
+
+        )
+
+
+    pitches: list[
+        float
+    ] = []
+
+
+    for start in candidate_starts:
+
+        pitch = _estimate_pitch_hz(
+
+            audio[
+
+                int(
+                    start
+                )
+                :
+                int(
+                    start
+                )
+                +
+                pitch_frame_length
+
+            ],
+
+            sr
+
+        )
+
+
+        if (
+
+            pitch is not None
+
+            and
+
+            math.isfinite(
+                pitch
+            )
+
+        ):
+
+            pitches.append(
+                pitch
+            )
+
+
+    if pitches:
+
+        pitch_values = np.asarray(
+
+            pitches,
+
+            dtype=np.float32
+
+        )
+
+
+        pitch_mean = float(
+
+            np.mean(
+                pitch_values
+            )
+
+        )
+
+
+        pitch_std = float(
 
             np.std(
-                voiced_rms
+                pitch_values
             )
 
-            / np.mean(
-                voiced_rms
-            )
         )
 
 
-        rms_db = librosa.amplitude_to_db(
+        pitch_cv = (
 
-            voiced_rms,
-
-            ref=np.max
-        )
-
-
-        energy_db_std = float(
-
-            np.std(
-                rms_db
+            pitch_std
+            /
+            max(
+                pitch_mean,
+                1e-9
             )
+
         )
+
+
+        pitch_range = float(
+
+            np.percentile(
+                pitch_values,
+                90
+            )
+
+            -
+
+            np.percentile(
+                pitch_values,
+                10
+            )
+
+        )
+
+
+        voiced_ratio = (
+
+            len(
+                pitches
+            )
+
+            /
+
+            max(
+                len(
+                    candidate_starts
+                ),
+                1
+            )
+
+        )
+
 
     else:
 
-        energy_cv = 0.0
-        energy_db_std = 0.0
-
-
-    # ========================================================
-    # PITCH / INTONATION
-    # ========================================================
-
-    try:
-
-        f0, voiced_flag, _ = librosa.pyin(
-
-            audio,
-
-            # Human speech range
-            fmin=65.0,
-
-            fmax=min(
-                700.0,
-                sr / 2.0 - 1.0
-            ),
-
-            sr=sr,
-
-            frame_length=2048,
-
-            hop_length=512,
-        )
-
-
-        if f0 is not None:
-
-            valid_f0 = f0[
-                np.isfinite(f0)
-            ]
-
-        else:
-
-            valid_f0 = np.array(
-                [],
-                dtype=np.float32
-            )
-
-
-        if (
-            valid_f0.size >= 3
-
-            and float(
-                np.mean(
-                    valid_f0
-                )
-            ) > 0
-        ):
-
-            pitch_mean = float(
-                np.mean(
-                    valid_f0
-                )
-            )
-
-            pitch_std = float(
-                np.std(
-                    valid_f0
-                )
-            )
-
-            pitch_cv = (
-                pitch_std
-                / pitch_mean
-            )
-
-            pitch_range = float(
-
-                np.percentile(
-                    valid_f0,
-                    90
-                )
-
-                - np.percentile(
-                    valid_f0,
-                    10
-                )
-            )
-
-
-        else:
-
-            pitch_mean = 0.0
-            pitch_std = 0.0
-            pitch_cv = 0.0
-            pitch_range = 0.0
-
-
-        if (
-            voiced_flag is not None
-
-            and len(
-                voiced_flag
-            )
-        ):
-
-            voiced_ratio = float(
-                np.mean(
-                    voiced_flag
-                )
-            )
-
-        else:
-
-            voiced_ratio = 0.0
-
-
-    except Exception:
-
-        # Still return pause/energy values if
-        # pitch extraction fails.
-
         pitch_mean = 0.0
+
         pitch_std = 0.0
+
         pitch_cv = 0.0
+
         pitch_range = 0.0
+
         voiced_ratio = 0.0
 
 
     # ========================================================
-    # PROSODY SCORING
+    # PROSODY SCORE
     # ========================================================
 
     pitch_score = _range_score(
 
         pitch_cv,
 
-        ideal_low=0.08,
-        ideal_high=0.30,
+        0.05,
 
-        outer_low=0.01,
-        outer_high=0.60
+        0.30,
+
+        0.0,
+
+        0.60
+
     )
 
 
@@ -910,37 +1850,53 @@ def calculate_acoustics(
 
         energy_cv,
 
-        ideal_low=0.12,
-        ideal_high=0.50,
+        0.10,
 
-        outer_low=0.01,
-        outer_high=1.00
+        0.55,
+
+        0.0,
+
+        1.10
+
     )
 
+
+    # No pause is okay for a
+    # short reading sentence.
 
     pause_score = _range_score(
 
         pause_ratio,
 
-        ideal_low=0.04,
-        ideal_high=0.22,
+        0.0,
 
-        outer_low=0.0,
-        outer_high=0.55
+        0.22,
+
+        0.0,
+
+        0.55
+
     )
 
 
-    # Weighted prosody score
     prosody_score = (
 
         0.45
-        * pitch_score
+        *
+        pitch_score
 
-        + 0.30
-        * energy_score
+        +
 
-        + 0.25
-        * pause_score
+        0.30
+        *
+        energy_score
+
+        +
+
+        0.25
+        *
+        pause_score
+
     )
 
 
@@ -953,18 +1909,16 @@ def calculate_acoustics(
 
         "active_speech_seconds":
             round_or_none(
-                active_seconds
+                active_speech_seconds
             ),
 
         "internal_pause_seconds":
             round_or_none(
-                internal_pause_seconds
+                pause_seconds
             ),
 
         "pause_count":
-            len(
-                pause_durations
-            ),
+            pause_count,
 
         "pause_ratio":
             round_or_none(
@@ -1005,11 +1959,6 @@ def calculate_acoustics(
                 4
             ),
 
-        "energy_db_std":
-            round_or_none(
-                energy_db_std
-            ),
-
         "prosody_score":
             round_or_none(
                 clamp(
@@ -1038,305 +1987,456 @@ def calculate_acoustics(
 
 
 # ============================================================
-# FFMPEG
+# VOSK MODEL
 # ============================================================
 
-def ensure_ffmpeg() -> None:
+def get_vosk_model() -> Any:
 
-    if shutil.which("ffmpeg") is None:
+    global _VOSK_MODEL
 
-        raise RuntimeError(
-            "FFmpeg was not found. "
-            "Install FFmpeg or use the Dockerfile."
+
+    if (
+        _VOSK_MODEL
+        is not None
+    ):
+
+        return (
+            _VOSK_MODEL
         )
 
 
-def convert_to_wav(
-    input_path: str | Path,
-    output_path: str | Path
-) -> None:
-
-    """
-    Convert virtually any common audio format to:
-
-    WAV
-    PCM 16-bit
-    Mono
-    16 kHz
-    """
-
-    ensure_ffmpeg()
-
-
-    command = [
-
-        "ffmpeg",
-
-        "-hide_banner",
-
-        "-loglevel",
-        "error",
-
-        "-y",
-
-        "-i",
-        str(input_path),
-
-        # Ignore video if MP4/WebM contains it
-        "-vn",
-
-        # Mono
-        "-ac",
-        "1",
-
-        # Wav2Vec2 sample rate
-        "-ar",
-        str(SAMPLE_RATE),
-
-        # PCM WAV
-        "-c:a",
-        "pcm_s16le",
-
-        str(output_path),
-    ]
-
-
-    result = subprocess.run(
-
-        command,
-
-        stdout=subprocess.PIPE,
-
-        stderr=subprocess.PIPE,
-
-        text=True,
-
-        timeout=90
-    )
-
-
-    if result.returncode != 0:
-
-        message = (
-
-            result.stderr
-
-            or
-
-            "FFmpeg could not decode the uploaded file."
-        ).strip()
-
-
-        raise ValueError(
-            message[-1200:]
-        )
-
-
-# ============================================================
-# LOAD WAV
-# ============================================================
-
-def load_normalized_wav(
-    wav_path: str | Path
-) -> np.ndarray:
-
-    audio, sr = sf.read(
-
-        str(wav_path),
-
-        dtype="float32",
-
-        always_2d=False
-    )
-
-
-    if sr != SAMPLE_RATE:
-
-        raise ValueError(
-
-            f"Expected {SAMPLE_RATE} Hz after conversion, "
-            f"got {sr} Hz."
-        )
-
-
-    # Stereo -> mono
-    if np.ndim(audio) > 1:
-
-        audio = np.mean(
-            audio,
-            axis=1
-        ).astype(
-            np.float32
-        )
-
-
-    return np.asarray(
-        audio,
-        dtype=np.float32
-    )
-
-
-# ============================================================
-# WAV2VEC2 MODEL
-# ============================================================
-
-def get_asr_pipeline() -> Any:
-
-    global _ASR_PIPELINE
-
-
-    # Already loaded
-    if _ASR_PIPELINE is not None:
-
-        return _ASR_PIPELINE
-
-
-    # Prevent multiple simultaneous model loads
     with _MODEL_LOCK:
 
-        if _ASR_PIPELINE is not None:
+        if (
+            _VOSK_MODEL
+            is not None
+        ):
 
-            return _ASR_PIPELINE
+            return (
+                _VOSK_MODEL
+            )
 
 
         try:
 
-            import torch
-
-            from transformers import pipeline
+            from vosk import (
+                Model,
+                SetLogLevel,
+            )
 
         except ImportError as exc:
 
             raise RuntimeError(
 
-                "Missing Wav2Vec2 dependencies. "
-                "Install requirements.txt first."
+                "Vosk is not installed. "
+                "Install requirements.txt "
+                "or use the Dockerfile."
 
             ) from exc
 
 
-        # GPU automatically used if available
-        device = (
-            0
-            if torch.cuda.is_available()
-            else -1
+        if not MODEL_PATH.exists():
+
+            raise RuntimeError(
+
+                f"Vosk model not found "
+                f"at {MODEL_PATH}. "
+                f"The included Dockerfile "
+                f"downloads it automatically."
+
+            )
+
+
+        SetLogLevel(
+            -1
         )
 
 
-        _ASR_PIPELINE = pipeline(
-
-            task=
-                "automatic-speech-recognition",
-
-            model=
-                MODEL_ID,
-
-            device=
-                device,
-
-            # Helps longer audio recordings
-            chunk_length_s=
-                20,
-
-            stride_length_s=
-                (4, 2),
+        started = (
+            time.perf_counter()
         )
 
 
-        return _ASR_PIPELINE
+        _VOSK_MODEL = Model(
+
+            str(
+                MODEL_PATH
+            )
+
+        )
+
+
+        elapsed = (
+
+            time.perf_counter()
+            -
+            started
+
+        )
+
+
+        print(
+
+            f"[STARTUP] "
+            f"Vosk model loaded "
+            f"in {elapsed:.2f}s "
+            f"from {MODEL_PATH}",
+
+            flush=True
+
+        )
+
+
+        return (
+            _VOSK_MODEL
+        )
 
 
 # ============================================================
-# TRANSCRIPTION
+# OPTIONAL REFERENCE GRAMMAR
 # ============================================================
 
-def transcribe(
-    audio: np.ndarray
+def _build_reference_grammar(
+    reference_text: str
+) -> str | None:
+
+    words = (
+        normalize_text(
+            reference_text
+        ).split()
+    )
+
+
+    if not words:
+
+        return None
+
+
+    # Remove duplicates while
+    # preserving order.
+
+    unique_words = list(
+
+        dict.fromkeys(
+            words
+        )
+
+    )
+
+
+    # Allow unknown words so the
+    # recognizer is not completely
+    # forced to output reference words.
+
+    unique_words.append(
+        "[unk]"
+    )
+
+
+    return json.dumps(
+        unique_words
+    )
+
+
+# ============================================================
+# VOSK TRANSCRIPTION
+# ============================================================
+
+def transcribe_vosk(
+    pcm_bytes: bytes,
+    reference_text: str | None = None,
+    constrain_vocabulary: bool = False
 ) -> dict[str, Any]:
 
-    asr = get_asr_pipeline()
+    try:
 
-
-    # Avoid overlapping inference calls when CPU constrained
-    with _INFERENCE_LOCK:
-
-        result = asr(
-
-            {
-                "raw":
-                    audio,
-
-                "sampling_rate":
-                    SAMPLE_RATE
-            },
-
-            return_timestamps="word",
+        from vosk import (
+            KaldiRecognizer,
         )
 
+    except ImportError as exc:
 
-    text = str(
-        result.get(
-            "text",
+        raise RuntimeError(
+
+            "Vosk is not installed."
+
+        ) from exc
+
+
+    model = (
+        get_vosk_model()
+    )
+
+
+    grammar = (
+
+        _build_reference_grammar(
+            reference_text
+            or
             ""
         )
-    ).strip()
+
+        if constrain_vocabulary
+
+        else None
+
+    )
 
 
-    chunks = []
+    if grammar:
 
+        recognizer = (
+            KaldiRecognizer(
 
-    for chunk in (
-        result.get(
-            "chunks",
-            []
+                model,
+
+                SAMPLE_RATE,
+
+                grammar
+
+            )
         )
 
-        or []
+
+    else:
+
+        recognizer = (
+            KaldiRecognizer(
+
+                model,
+
+                SAMPLE_RATE
+
+            )
+        )
+
+
+    recognizer.SetWords(
+        True
+    )
+
+
+    all_words: list[
+        dict[str, Any]
+    ] = []
+
+
+    text_parts: list[
+        str
+    ] = []
+
+
+    # 8000 bytes:
+    # 0.25 seconds of 16kHz PCM16.
+
+    chunk_bytes = 8000
+
+
+    for offset in range(
+
+        0,
+
+        len(
+            pcm_bytes
+        ),
+
+        chunk_bytes
+
     ):
 
-        timestamp = (
-            chunk.get(
-                "timestamp"
+        chunk = pcm_bytes[
+
+            offset
+            :
+            offset
+            +
+            chunk_bytes
+
+        ]
+
+
+        if (
+            recognizer
+            .AcceptWaveform(
+                chunk
+            )
+        ):
+
+            payload = json.loads(
+
+                recognizer.Result()
+                or
+                "{}"
+
             )
 
-            or (
-                None,
-                None
+
+            if payload.get(
+                "text"
+            ):
+
+                text_parts.append(
+
+                    str(
+                        payload[
+                            "text"
+                        ]
+                    )
+
+                )
+
+
+            if isinstance(
+
+                payload.get(
+                    "result"
+                ),
+
+                list
+
+            ):
+
+                all_words.extend(
+
+                    payload[
+                        "result"
+                    ]
+
+                )
+
+
+    # Final segment
+
+    payload = json.loads(
+
+        recognizer.FinalResult()
+        or
+        "{}"
+
+    )
+
+
+    if payload.get(
+        "text"
+    ):
+
+        text_parts.append(
+
+            str(
+                payload[
+                    "text"
+                ]
             )
+
         )
 
 
-        chunks.append(
+    if isinstance(
 
+        payload.get(
+            "result"
+        ),
+
+        list
+
+    ):
+
+        all_words.extend(
+
+            payload[
+                "result"
+            ]
+
+        )
+
+
+    # ========================================================
+    # NORMALIZE WORD TIMESTAMPS
+    # ========================================================
+
+    normalized_words = []
+
+
+    for item in all_words:
+
+        normalized_words.append(
             {
                 "word":
                     str(
-                        chunk.get(
-                            "text",
+                        item.get(
+                            "word",
                             ""
                         )
                     ).strip(),
 
                 "start":
                     round_or_none(
-                        timestamp[0]
+                        item.get(
+                            "start"
+                        )
                     ),
 
                 "end":
                     round_or_none(
-                        timestamp[1]
+                        item.get(
+                            "end"
+                        )
+                    ),
+
+                "confidence":
+                    round_or_none(
+                        item.get(
+                            "conf"
+                        ),
+                        4
                     ),
             }
+        )
+
+
+    transcript = " ".join(
+
+        part.strip()
+
+        for part in text_parts
+
+        if part.strip()
+
+    ).strip()
+
+
+    if (
+        not transcript
+        and
+        normalized_words
+    ):
+
+        transcript = " ".join(
+
+            item["word"]
+
+            for item
+            in normalized_words
+
+            if item[
+                "word"
+            ]
+
         )
 
 
     return {
 
         "text":
-            text,
+            transcript,
 
         "words":
-            chunks
+            normalized_words,
+
+        "constrained_vocabulary":
+            bool(
+                grammar
+            ),
     }
 
 
@@ -1346,56 +2446,103 @@ def transcribe(
 
 def analyze_wav(
     wav_path: str | Path,
-    reference_text: str | None = None
+    reference_text: str | None = None,
+    constrain_vocabulary: bool = False
 ) -> dict[str, Any]:
 
-    # Load converted WAV
-    audio = load_normalized_wav(
+    total_start = (
+        time.perf_counter()
+    )
+
+
+    # ========================================================
+    # LOAD
+    # ========================================================
+
+    load_start = (
+        time.perf_counter()
+    )
+
+
+    (
+        audio,
+        pcm_bytes,
+        duration
+    ) = load_pcm16_wav(
         wav_path
     )
 
 
-    duration = (
-        len(audio)
-        / float(SAMPLE_RATE)
-    )
+    load_ms = (
 
+        time.perf_counter()
+        -
+        load_start
 
-    # Prevent very long requests
-    if duration > MAX_AUDIO_SECONDS:
-
-        raise ValueError(
-
-            f"Audio is {duration:.1f}s; "
-            f"maximum allowed is "
-            f"{MAX_AUDIO_SECONDS:.0f}s."
-        )
+    ) * 1000
 
 
     # ========================================================
     # PROSODY
     # ========================================================
 
+    prosody_start = (
+        time.perf_counter()
+    )
+
+
     acoustics = calculate_acoustics(
 
         audio,
 
         SAMPLE_RATE
+
     )
 
 
+    prosody_ms = (
+
+        time.perf_counter()
+        -
+        prosody_start
+
+    ) * 1000
+
+
     # ========================================================
-    # WAV2VEC2 TRANSCRIPTION
+    # VOSK
     # ========================================================
 
-    transcript = transcribe(
-        audio
+    asr_start = (
+        time.perf_counter()
     )
 
 
-    spoken_text = transcript[
-        "text"
-    ]
+    transcript = transcribe_vosk(
+
+        pcm_bytes,
+
+        reference_text,
+
+        constrain_vocabulary
+
+    )
+
+
+    asr_ms = (
+
+        time.perf_counter()
+        -
+        asr_start
+
+    ) * 1000
+
+
+    spoken_text = (
+        transcript[
+            "text"
+        ]
+    )
 
 
     recognized_word_count = len(
@@ -1403,6 +2550,7 @@ def analyze_wav(
         normalize_text(
             spoken_text
         ).split()
+
     )
 
 
@@ -1415,20 +2563,29 @@ def analyze_wav(
         recognized_word_count,
 
         float(
+
             acoustics[
                 "duration_seconds"
             ]
 
-            or duration
+            or
+
+            duration
+
         ),
 
         float(
+
             acoustics[
                 "active_speech_seconds"
             ]
 
-            or duration
+            or
+
+            duration
+
         ),
+
     )
 
 
@@ -1440,11 +2597,15 @@ def analyze_wav(
 
 
     if (
+
         reference_text
 
-        and normalize_text(
+        and
+
+        normalize_text(
             reference_text
         )
+
     ):
 
         accuracy = align_words(
@@ -1452,17 +2613,40 @@ def analyze_wav(
             reference_text,
 
             spoken_text
+
         )
 
 
-    # ========================================================
-    # RESPONSE
-    # ========================================================
+    total_ms = (
+
+        time.perf_counter()
+        -
+        total_start
+
+    ) * 1000
+
+
+    print(
+
+        f"[TIMING] "
+        f"audio={duration:.2f}s "
+        f"load={load_ms:.0f}ms "
+        f"prosody={prosody_ms:.0f}ms "
+        f"vosk={asr_ms:.0f}ms "
+        f"total={total_ms:.0f}ms",
+
+        flush=True
+
+    )
+
 
     return {
 
         "model":
-            MODEL_ID,
+            "vosk-model-small-en-us-0.15",
+
+        "engine":
+            "vosk",
 
         "transcript":
             spoken_text,
@@ -1481,26 +2665,142 @@ def analyze_wav(
         "prosody":
             acoustics,
 
+        "timing": {
+
+            "audio_duration_seconds":
+                round(
+                    duration,
+                    2
+                ),
+
+            "audio_load_ms":
+                round(
+                    load_ms
+                ),
+
+            "prosody_ms":
+                round(
+                    prosody_ms
+                ),
+
+            "asr_ms":
+                round(
+                    asr_ms
+                ),
+
+            "total_analysis_ms":
+                round(
+                    total_ms
+                ),
+        },
+
         "notes": {
 
             "accuracy":
 
-                "ASR-based reading accuracy using WER "
-                "against reference_text. "
-                "It is not yet phoneme-level "
-                "pronunciation scoring.",
+                "Word-level reading accuracy "
+                "based on Vosk transcription "
+                "vs reference_text; not "
+                "phoneme-level pronunciation "
+                "scoring.",
 
             "prosody":
 
-                "Prosody is a heuristic based on "
-                "pitch variation, energy variation "
-                "and pauses."
+                "Lightweight heuristic from "
+                "pitch variation, energy "
+                "variation and pauses; "
+                "no Librosa/PyTorch model "
+                "is used.",
+
+            "constrained_vocabulary":
+
+                transcript[
+                    "constrained_vocabulary"
+                ],
         },
     }
 
 
 # ============================================================
-# UPLOAD HANDLER
+# FASTAPI LIFESPAN
+# ============================================================
+
+@asynccontextmanager
+async def lifespan(
+    app: FastAPI
+):
+
+    if PRELOAD_MODEL:
+
+        await run_in_threadpool(
+            get_vosk_model
+        )
+
+    yield
+
+
+# ============================================================
+# FASTAPI
+# ============================================================
+
+app = FastAPI(
+
+    title=
+        APP_NAME,
+
+    version=
+        "2.0.0",
+
+    lifespan=
+        lifespan
+
+)
+
+
+# ============================================================
+# CORS
+# ============================================================
+
+allow_origins = [
+
+    x.strip()
+
+    for x in os.getenv(
+        "ALLOW_ORIGINS",
+        "*"
+    ).split(",")
+
+    if x.strip()
+
+]
+
+
+app.add_middleware(
+
+    CORSMiddleware,
+
+    allow_origins=
+        allow_origins,
+
+    allow_credentials=
+        False
+        if allow_origins == ["*"]
+        else True,
+
+    allow_methods=[
+        "GET",
+        "POST"
+    ],
+
+    allow_headers=[
+        "*"
+    ],
+
+)
+
+
+# ============================================================
+# UPLOAD
 # ============================================================
 
 async def save_upload_limited(
@@ -1509,9 +2809,13 @@ async def save_upload_limited(
 ) -> int:
 
     max_bytes = int(
+
         MAX_UPLOAD_MB
-        * 1024
-        * 1024
+        *
+        1024
+        *
+        1024
+
     )
 
 
@@ -1525,11 +2829,14 @@ async def save_upload_limited(
         while True:
 
             chunk = await upload.read(
-                1024 * 1024
+                1024
+                *
+                1024
             )
 
 
             if not chunk:
+
                 break
 
 
@@ -1545,8 +2852,11 @@ async def save_upload_limited(
                     status_code=413,
 
                     detail=(
+
                         f"File exceeds "
-                        f"{MAX_UPLOAD_MB:g} MB limit."
+                        f"{MAX_UPLOAD_MB:g} "
+                        f"MB limit."
+
                     )
                 )
 
@@ -1564,6 +2874,7 @@ async def save_upload_limited(
 
             detail=
                 "Uploaded file is empty."
+
         )
 
 
@@ -1585,8 +2896,11 @@ def root() -> dict[str, Any]:
         "status":
             "ok",
 
+        "engine":
+            "vosk",
+
         "model":
-            MODEL_ID,
+            "vosk-model-small-en-us-0.15",
 
         "endpoint":
             "POST /analyze",
@@ -1594,7 +2908,7 @@ def root() -> dict[str, Any]:
 
 
 # ============================================================
-# HEALTH CHECK
+# HEALTH
 # ============================================================
 
 @app.get("/health")
@@ -1608,25 +2922,33 @@ def health() -> dict[str, Any]:
         "ffmpeg":
             shutil.which(
                 "ffmpeg"
-            ) is not None,
+            )
+            is not None,
+
+        "model_path_exists":
+            MODEL_PATH.exists(),
 
         "model_loaded":
-            _ASR_PIPELINE is not None,
+            _VOSK_MODEL
+            is not None,
     }
 
 
 # ============================================================
-# ANALYZE ENDPOINT
+# ANALYZE
 # ============================================================
 
 @app.post("/analyze")
 async def analyze_endpoint(
 
     file: UploadFile = File(
+
         ...,
+
         description=(
-            "WAV, MP3, M4A, AAC, FLAC, "
-            "OGG, OPUS, WebM, MP4, etc."
+            "WAV, MP3, M4A, AAC, "
+            "FLAC, OGG, OPUS, "
+            "WebM, MP4, etc."
         )
     ),
 
@@ -1634,62 +2956,109 @@ async def analyze_endpoint(
         default=None
     ),
 
+    constrain_vocabulary: bool = Form(
+
+        default=False,
+
+        description=(
+            "Optional. Restrict Vosk "
+            "to expected words. "
+            "Can improve recognition, "
+            "but may inflate accuracy."
+        )
+
+    ),
+
 ) -> dict[str, Any]:
 
+    request_start = (
+        time.perf_counter()
+    )
+
+
     filename = (
+
         file.filename
-        or "upload.bin"
+
+        or
+
+        "upload.bin"
+
     )
 
 
     suffix = (
+
         Path(
             filename
         ).suffix[:12]
 
-        or ".bin"
+        or
+
+        ".bin"
+
     )
 
 
     try:
 
         with tempfile.TemporaryDirectory(
-            prefix="reading-audio-"
+
+            prefix=
+                "reading-audio-"
+
         ) as temp_directory:
+
 
             temp_directory = Path(
                 temp_directory
             )
 
 
-            # Original upload
             original_path = (
 
                 temp_directory
 
-                / f"input{suffix}"
+                /
+
+                f"input{suffix}"
+
             )
 
 
-            # Normalized WAV
             wav_path = (
 
                 temp_directory
 
-                / "normalized.wav"
+                /
+
+                "normalized.wav"
+
             )
 
 
-            # Save upload
+            # =================================================
+            # SAVE UPLOAD
+            # =================================================
+
             await save_upload_limited(
 
                 file,
 
                 original_path
+
             )
 
 
-            # Convert audio using FFmpeg
+            # =================================================
+            # FFMPEG
+            # =================================================
+
+            conversion_start = (
+                time.perf_counter()
+            )
+
+
             await run_in_threadpool(
 
                 convert_to_wav,
@@ -1697,21 +3066,70 @@ async def analyze_endpoint(
                 original_path,
 
                 wav_path
+
             )
 
 
-            # Run Wav2Vec2 + scoring
+            conversion_ms = (
+
+                time.perf_counter()
+                -
+                conversion_start
+
+            ) * 1000
+
+
+            # =================================================
+            # ANALYZE
+            # =================================================
+
             result = await run_in_threadpool(
 
                 analyze_wav,
 
                 wav_path,
 
-                reference_text
+                reference_text,
+
+                constrain_vocabulary
+
             )
 
 
-            result["input"] = {
+            request_ms = (
+
+                time.perf_counter()
+                -
+                request_start
+
+            ) * 1000
+
+
+            # Add conversion timing
+
+            result[
+                "timing"
+            ][
+                "audio_conversion_ms"
+            ] = round(
+                conversion_ms
+            )
+
+
+            result[
+                "timing"
+            ][
+                "total_server_ms"
+            ] = round(
+                request_ms
+            )
+
+
+            # Input info
+
+            result[
+                "input"
+            ] = {
 
                 "filename":
                     filename,
@@ -1720,7 +3138,8 @@ async def analyze_endpoint(
                     file.content_type,
 
                 "normalized_format":
-                    "wav/pcm_s16le/mono/16000Hz",
+                    "wav/pcm_s16le/"
+                    "mono/16000Hz",
             }
 
 
@@ -1750,9 +3169,10 @@ async def analyze_endpoint(
 
             status_code=422,
 
-            detail=str(
-                exc
-            )
+            detail=
+                str(
+                    exc
+                )
 
         ) from exc
 
@@ -1763,9 +3183,10 @@ async def analyze_endpoint(
 
             status_code=503,
 
-            detail=str(
-                exc
-            )
+            detail=
+                str(
+                    exc
+                )
 
         ) from exc
 
@@ -1778,11 +3199,10 @@ async def analyze_endpoint(
 
             detail=(
 
-                "Analysis failed: "
-
+                f"Analysis failed: "
                 f"{type(exc).__name__}: "
-
                 f"{exc}"
+
             )
 
         ) from exc

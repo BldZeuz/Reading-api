@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+.venv/
+venv/
+
+.git/
+.gitignore
+
+*.wav
+*.mp3
+*.m4a
+*.ogg
+*.webm
+*.flac
