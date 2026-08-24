@@ -37,12 +37,14 @@ APP_NAME = "Vosk Reading Analysis API"
 
 SAMPLE_RATE = 16_000
 
+
 MODEL_PATH = Path(
     os.getenv(
         "VOSK_MODEL_PATH",
         "/opt/vosk-model"
     )
 )
+
 
 MAX_UPLOAD_MB = float(
     os.getenv(
@@ -51,12 +53,24 @@ MAX_UPLOAD_MB = float(
     )
 )
 
+
 MAX_AUDIO_SECONDS = float(
     os.getenv(
         "MAX_AUDIO_SECONDS",
         "60"
     )
 )
+
+
+# IMPORTANT:
+#
+# These should eventually be changed depending on:
+# - Grade level
+# - Quarter / school period
+# - Passage difficulty
+#
+# Do NOT assume 110-180 WPM is appropriate
+# for every Grade 1-3 learner.
 
 TARGET_WPM_MIN = float(
     os.getenv(
@@ -65,12 +79,14 @@ TARGET_WPM_MIN = float(
     )
 )
 
+
 TARGET_WPM_MAX = float(
     os.getenv(
         "TARGET_WPM_MAX",
         "180"
     )
 )
+
 
 PRELOAD_MODEL = (
     os.getenv(
@@ -86,10 +102,28 @@ PRELOAD_MODEL = (
 
 
 # ============================================================
-# GLOBAL MODEL
+# READING PROFICIENCY WEIGHTS
+# ============================================================
+
+PROFICIENCY_WEIGHTS = {
+
+    "accuracy": 0.30,
+
+    "speed": 0.20,
+
+    "prosody": 0.15,
+
+    "comprehension": 0.35,
+
+}
+
+
+# ============================================================
+# GLOBAL VOSK MODEL
 # ============================================================
 
 _VOSK_MODEL: Any | None = None
+
 _MODEL_LOCK = threading.Lock()
 
 
@@ -182,6 +216,7 @@ def align_words(
         ).split()
     )
 
+
     n = len(
         reference_words
     )
@@ -191,18 +226,35 @@ def align_words(
     )
 
 
+    # Dynamic programming table
+
     dp = [
+
         [0] * (m + 1)
-        for _ in range(n + 1)
+
+        for _ in range(
+            n + 1
+        )
+
     ]
+
 
     back: list[
-        list[str | None]
+        list[
+            str | None
+        ]
     ] = [
+
         [None] * (m + 1)
-        for _ in range(n + 1)
+
+        for _ in range(
+            n + 1
+        )
+
     ]
 
+
+    # Initial deletions
 
     for i in range(
         1,
@@ -215,6 +267,8 @@ def align_words(
             "deletion"
         )
 
+
+    # Initial insertions
 
     for j in range(
         1,
@@ -285,6 +339,7 @@ def align_words(
 
             candidates.extend(
                 [
+
                     (
                         dp[i - 1][j] + 1,
                         "deletion"
@@ -294,6 +349,7 @@ def align_words(
                         dp[i][j - 1] + 1,
                         "insertion"
                     ),
+
                 ]
             )
 
@@ -306,6 +362,7 @@ def align_words(
                     x[0],
                     priority[x[1]]
                 )
+
             )
 
 
@@ -467,6 +524,7 @@ def align_words(
 
             j -= 1
 
+
         else:
 
             break
@@ -475,12 +533,28 @@ def align_words(
     operations.reverse()
 
 
+    # ========================================================
+    # WER / ACCURACY
+    # ========================================================
+
     errors = (
-        counts["substitution"]
+
+        counts[
+            "substitution"
+        ]
+
         +
-        counts["deletion"]
+
+        counts[
+            "deletion"
+        ]
+
         +
-        counts["insertion"]
+
+        counts[
+            "insertion"
+        ]
+
     )
 
 
@@ -492,19 +566,25 @@ def align_words(
             n
         )
 
+
         accuracy = clamp(
+
             100.0
+
             *
+
             (
                 1.0
                 -
                 wer
             )
+
         )
 
     else:
 
         wer = None
+
         accuracy = None
 
 
@@ -549,11 +629,12 @@ def align_words(
 
         "word_feedback":
             operations,
+
     }
 
 
 # ============================================================
-# GENERIC SCORE
+# GENERIC RANGE SCORE
 # ============================================================
 
 def _range_score(
@@ -563,6 +644,8 @@ def _range_score(
     outer_low: float,
     outer_high: float
 ) -> float:
+
+    # Perfect range
 
     if (
         ideal_low
@@ -575,28 +658,40 @@ def _range_score(
         return 100.0
 
 
+    # Too low
+
     if value < ideal_low:
 
         if value <= outer_low:
+
             return 0.0
 
+
         return (
+
             100.0
+
             *
+
             (
                 value
                 -
                 outer_low
             )
+
             /
+
             max(
                 ideal_low
                 -
                 outer_low,
                 1e-9
             )
+
         )
 
+
+    # Too high
 
     if value >= outer_high:
 
@@ -604,84 +699,114 @@ def _range_score(
 
 
     return (
+
         100.0
+
         *
+
         (
             outer_high
             -
             value
         )
+
         /
+
         max(
             outer_high
             -
             ideal_high,
             1e-9
         )
+
     )
 
 
 # ============================================================
-# SPEED
+# SPEED / FLUENCY
 # ============================================================
 
 def calculate_speed(
-    word_count: int,
+    recognized_word_count: int,
+    correct_word_count: int,
     total_seconds: float,
     active_speech_seconds: float
 ) -> dict[str, Any]:
 
-    if total_seconds > 0:
+    # Raw recognized WPM
 
-        gross_wpm = (
-            word_count
-            *
-            60.0
-            /
-            total_seconds
-        )
+    gross_wpm = (
 
-    else:
+        recognized_word_count
+        *
+        60.0
+        /
+        total_seconds
 
-        gross_wpm = 0.0
+        if total_seconds > 0
+
+        else 0.0
+
+    )
 
 
-    if (
+    # Correct Words Per Minute
+
+    wcpm = (
+
+        correct_word_count
+        *
+        60.0
+        /
+        total_seconds
+
+        if total_seconds > 0
+
+        else 0.0
+
+    )
+
+
+    # Speaking speed while actually speaking
+
+    articulation_wpm = (
+
+        recognized_word_count
+        *
+        60.0
+        /
         active_speech_seconds
-        >
-        0
-    ):
 
-        articulation_wpm = (
-            word_count
-            *
-            60.0
-            /
-            active_speech_seconds
-        )
+        if active_speech_seconds > 0
 
-    else:
+        else 0.0
 
-        articulation_wpm = 0.0
+    )
 
+
+    # IMPORTANT:
+    # speed_score uses correct words/minute.
 
     score = _range_score(
 
-        gross_wpm,
+        wcpm,
 
         TARGET_WPM_MIN,
 
         TARGET_WPM_MAX,
 
-        50.0,
+        0.0,
 
-        260.0
+        max(
+            TARGET_WPM_MAX * 1.6,
+            TARGET_WPM_MAX + 60
+        )
 
     )
 
 
     if (
-        gross_wpm
+        wcpm
         <
         TARGET_WPM_MIN
     ):
@@ -690,7 +815,7 @@ def calculate_speed(
 
 
     elif (
-        gross_wpm
+        wcpm
         >
         TARGET_WPM_MAX
     ):
@@ -705,14 +830,24 @@ def calculate_speed(
 
     return {
 
-        "word_count":
+        "recognized_word_count":
             int(
-                word_count
+                recognized_word_count
+            ),
+
+        "correct_word_count":
+            int(
+                correct_word_count
             ),
 
         "gross_wpm":
             round_or_none(
                 gross_wpm
+            ),
+
+        "wcpm":
+            round_or_none(
+                wcpm
             ),
 
         "articulation_wpm":
@@ -729,9 +864,502 @@ def calculate_speed(
             label,
 
         "target_wpm_range": [
+
             TARGET_WPM_MIN,
+
             TARGET_WPM_MAX
+
         ],
+
+        "note":
+            (
+                "speed_score is based on WCPM "
+                "(correct words per minute). "
+                "Use grade-appropriate "
+                "TARGET_WPM_MIN/TARGET_WPM_MAX values."
+            ),
+
+    }
+
+
+# ============================================================
+# READING PROFICIENCY
+# ============================================================
+
+def calculate_reading_proficiency(
+    accuracy: float | None,
+    speed: float | None,
+    prosody: float | None,
+    comprehension: float | None
+) -> dict[str, Any]:
+
+    """
+    Application-level reading proficiency.
+
+    Weights:
+
+        Accuracy       = 30%
+        Speed          = 20%
+        Prosody        = 15%
+        Comprehension  = 35%
+
+    This is an application heuristic.
+
+    Before treating it as an official
+    educational classification, calibrate
+    the weights and thresholds against
+    your curriculum or assessment framework.
+    """
+
+
+    raw_components = {
+
+        "accuracy":
+            accuracy,
+
+        "speed":
+            speed,
+
+        "prosody":
+            prosody,
+
+        "comprehension":
+            comprehension,
+
+    }
+
+
+    # ========================================================
+    # CHECK ORAL READING COMPONENTS
+    # ========================================================
+
+    missing_oral = [
+
+        name
+
+        for name
+        in (
+            "accuracy",
+            "speed",
+            "prosody"
+        )
+
+        if raw_components[
+            name
+        ] is None
+
+    ]
+
+
+    if missing_oral:
+
+        return {
+
+            "overall_score":
+                None,
+
+            "base_weighted_score":
+                None,
+
+            "status":
+                "incomplete",
+
+            "level":
+                "Incomplete",
+
+            "weakest_skill":
+                None,
+
+            "recommended_activity":
+                None,
+
+            "components": {
+
+                key:
+                    round_or_none(
+                        value
+                    )
+
+                for (
+                    key,
+                    value
+                )
+                in raw_components.items()
+
+            },
+
+            "weights":
+                PROFICIENCY_WEIGHTS,
+
+            "gates_applied":
+                [],
+
+            "message":
+                (
+                    "Missing required oral-reading "
+                    "score(s): "
+                    +
+                    ", ".join(
+                        missing_oral
+                    )
+                ),
+
+        }
+
+
+    # ========================================================
+    # WAIT FOR COMPREHENSION
+    # ========================================================
+
+    if comprehension is None:
+
+        oral_values = {
+
+            "accuracy":
+                clamp(
+                    float(
+                        accuracy
+                    )
+                ),
+
+            "speed":
+                clamp(
+                    float(
+                        speed
+                    )
+                ),
+
+            "prosody":
+                clamp(
+                    float(
+                        prosody
+                    )
+                ),
+
+        }
+
+
+        weakest_oral = min(
+
+            oral_values,
+
+            key=lambda name:
+                oral_values[name]
+
+        )
+
+
+        return {
+
+            "overall_score":
+                None,
+
+            "base_weighted_score":
+                None,
+
+            "status":
+                "waiting_for_comprehension",
+
+            "level":
+                "Waiting for comprehension",
+
+            "weakest_skill":
+                weakest_oral,
+
+            "recommended_activity":
+                None,
+
+            "components": {
+
+                "accuracy":
+                    round(
+                        oral_values[
+                            "accuracy"
+                        ],
+                        1
+                    ),
+
+                "speed":
+                    round(
+                        oral_values[
+                            "speed"
+                        ],
+                        1
+                    ),
+
+                "prosody":
+                    round(
+                        oral_values[
+                            "prosody"
+                        ],
+                        1
+                    ),
+
+                "comprehension":
+                    None,
+
+            },
+
+            "weights":
+                PROFICIENCY_WEIGHTS,
+
+            "gates_applied":
+                [],
+
+            "message":
+                (
+                    "Complete the comprehension activity "
+                    "to calculate overall reading proficiency."
+                ),
+
+        }
+
+
+    # ========================================================
+    # NORMALIZE ALL FOUR COMPONENTS
+    # ========================================================
+
+    components = {
+
+        "accuracy":
+            clamp(
+                float(
+                    accuracy
+                )
+            ),
+
+        "speed":
+            clamp(
+                float(
+                    speed
+                )
+            ),
+
+        "prosody":
+            clamp(
+                float(
+                    prosody
+                )
+            ),
+
+        "comprehension":
+            clamp(
+                float(
+                    comprehension
+                )
+            ),
+
+    }
+
+
+    # ========================================================
+    # WEIGHTED SCORE
+    # ========================================================
+
+    base_score = sum(
+
+        components[name]
+
+        *
+
+        PROFICIENCY_WEIGHTS[name]
+
+        for name
+        in PROFICIENCY_WEIGHTS
+
+    )
+
+
+    overall_score = (
+        base_score
+    )
+
+
+    gates_applied: list[str] = []
+
+
+    # ========================================================
+    # PROFICIENCY GUARDRAILS
+    # ========================================================
+    #
+    # These prevent extremely weak decoding or
+    # comprehension from being hidden by high scores
+    # in another area.
+    #
+    # These are APP RULES, not official standards.
+    # ========================================================
+
+
+    if (
+        components[
+            "accuracy"
+        ]
+        <
+        60
+    ):
+
+        overall_score = min(
+
+            overall_score,
+
+            59.0
+
+        )
+
+
+        gates_applied.append(
+
+            "accuracy_below_60"
+
+        )
+
+
+    if (
+        components[
+            "comprehension"
+        ]
+        <
+        60
+    ):
+
+        overall_score = min(
+
+            overall_score,
+
+            69.0
+
+        )
+
+
+        gates_applied.append(
+
+            "comprehension_below_60"
+
+        )
+
+
+    # ========================================================
+    # PROFICIENCY LEVEL
+    # ========================================================
+
+    if overall_score >= 90:
+
+        level = "Strong"
+
+
+    elif overall_score >= 80:
+
+        level = "On Track"
+
+
+    elif overall_score >= 70:
+
+        level = "Developing"
+
+
+    elif overall_score >= 60:
+
+        level = "Needs Practice"
+
+
+    else:
+
+        level = "Needs Support"
+
+
+    # ========================================================
+    # FIND WEAKEST SKILL
+    # ========================================================
+
+    weakest_skill = min(
+
+        components,
+
+        key=lambda name:
+            components[name]
+
+    )
+
+
+    # ========================================================
+    # ACTIVITY RECOMMENDATION
+    # ========================================================
+
+    recommendations = {
+
+        "accuracy":
+            "phonics_and_word_decoding",
+
+        "speed":
+            "repeated_reading_and_fluency",
+
+        "prosody":
+            "expression_and_phrase_reading",
+
+        "comprehension":
+            "reading_comprehension",
+
+    }
+
+
+    return {
+
+        "overall_score":
+            round(
+                overall_score,
+                1
+            ),
+
+        "base_weighted_score":
+            round(
+                base_score,
+                1
+            ),
+
+        "status":
+            "complete",
+
+        "level":
+            level,
+
+        "weakest_skill":
+            weakest_skill,
+
+        "recommended_activity":
+            recommendations[
+                weakest_skill
+            ],
+
+        "components": {
+
+            name:
+                round(
+                    value,
+                    1
+                )
+
+            for (
+                name,
+                value
+            )
+            in components.items()
+
+        },
+
+        "weights":
+            PROFICIENCY_WEIGHTS,
+
+        "gates_applied":
+            gates_applied,
+
+        "message":
+            (
+                "Application-level proficiency estimate. "
+                "Calibrate weights and thresholds to your "
+                "curriculum before using this as an official "
+                "educational classification."
+            ),
+
     }
 
 
@@ -781,7 +1409,7 @@ def convert_to_wav(
             input_path
         ),
 
-        # Ignore video streams
+        # Ignore video
         "-vn",
 
         # Mono
@@ -794,13 +1422,14 @@ def convert_to_wav(
             SAMPLE_RATE
         ),
 
-        # 16-bit PCM WAV
+        # PCM16
         "-c:a",
         "pcm_s16le",
 
         str(
             output_path
         ),
+
     ]
 
 
@@ -840,7 +1469,11 @@ def convert_to_wav(
 
 
         raise ValueError(
-            message[-1200:]
+
+            message[
+                -1200:
+            ]
+
         )
 
 
@@ -862,6 +1495,7 @@ def load_pcm16_wav(
         ),
         "rb"
     ) as wf:
+
 
         if (
             wf.getnchannels()
@@ -951,7 +1585,9 @@ def load_pcm16_wav(
     if duration <= 0.05:
 
         raise ValueError(
+
             "Audio is too short to analyze."
+
         )
 
 
@@ -998,9 +1634,13 @@ def load_pcm16_wav(
 
 
     return (
+
         audio,
+
         frames,
+
         duration
+
     )
 
 
@@ -1018,7 +1658,9 @@ def _frame_rms(
 ]:
 
     if (
-        len(audio)
+        len(
+            audio
+        )
         <
         frame_length
     ):
@@ -1031,7 +1673,9 @@ def _frame_rms(
                 0,
                 frame_length
                 -
-                len(audio)
+                len(
+                    audio
+                )
             )
 
         )
@@ -1041,17 +1685,25 @@ def _frame_rms(
 
             np.array(
                 [
+
                     float(
+
                         np.sqrt(
+
                             np.mean(
                                 padded
                                 *
                                 padded
                             )
+
                             +
+
                             1e-12
+
                         )
+
                     )
+
                 ]
             ),
 
@@ -1067,7 +1719,9 @@ def _frame_rms(
 
         0,
 
-        len(audio)
+        len(
+            audio
+        )
         -
         frame_length
         +
@@ -1129,8 +1783,11 @@ def _frame_rms(
 
 
     return (
+
         rms,
+
         starts
+
     )
 
 
@@ -1143,12 +1800,14 @@ def _estimate_pitch_hz(
     sr: int = SAMPLE_RATE
 ) -> float | None:
 
-    # Downsample from 16kHz -> 8kHz.
-    # This makes autocorrelation much cheaper.
+    # Downsample 16k -> 8k
+    # for cheaper autocorrelation.
 
     x = np.asarray(
 
-        frame[::2],
+        frame[
+            ::2
+        ],
 
         dtype=np.float32
 
@@ -1162,7 +1821,13 @@ def _estimate_pitch_hz(
     )
 
 
-    if len(x) < 160:
+    if (
+        len(
+            x
+        )
+        <
+        160
+    ):
 
         return None
 
@@ -1170,13 +1835,17 @@ def _estimate_pitch_hz(
     # Remove DC offset
 
     x = (
+
         x
+
         -
+
         float(
             np.mean(
                 x
             )
         )
+
     )
 
 
@@ -1196,17 +1865,20 @@ def _estimate_pitch_hz(
         return None
 
 
-    # Window signal
+    # Window
 
     x *= (
+
         np.hanning(
             len(
                 x
             )
         )
+
         .astype(
             np.float32
         )
+
     )
 
 
@@ -1263,7 +1935,9 @@ def _estimate_pitch_hz(
 
     max_lag = min(
 
-        len(corr)
+        len(
+            corr
+        )
         -
         1,
 
@@ -1397,9 +2071,6 @@ def calculate_acoustics(
         )
 
 
-    # About -24dB relative to
-    # loudest short-time RMS frame.
-
     threshold = max(
 
         max_rms
@@ -1461,7 +2132,9 @@ def calculate_acoustics(
 
         int(
             np.argmax(
-                speech_mask[::-1]
+                speech_mask[
+                    ::-1
+                ]
             )
         )
 
@@ -1494,11 +2167,15 @@ def calculate_acoustics(
         1,
 
         int(
+
             round(
+
                 0.15
                 /
                 hop_seconds
+
             )
+
         )
 
     )
@@ -1579,9 +2256,11 @@ def calculate_acoustics(
     # ========================================================
 
     voiced_rms = (
+
         rms[
             speech_mask
         ]
+
     )
 
 
@@ -1603,11 +2282,15 @@ def calculate_acoustics(
     energy_cv = (
 
         float(
+
             np.std(
                 voiced_rms
             )
+
             /
+
             energy_mean
+
         )
 
         if energy_mean > 1e-9
@@ -1618,7 +2301,7 @@ def calculate_acoustics(
 
 
     # ========================================================
-    # PITCH
+    # PITCH VARIATION
     # ========================================================
 
     pitch_frame_length = int(
@@ -1656,8 +2339,8 @@ def calculate_acoustics(
     )
 
 
-    # Prevent long audio from
-    # creating excessive work.
+    # Limit pitch calculations
+    # to prevent excessive CPU use.
 
     if (
         len(
@@ -1770,7 +2453,9 @@ def calculate_acoustics(
         pitch_cv = (
 
             pitch_std
+
             /
+
             max(
                 pitch_mean,
                 1e-9
@@ -1860,9 +2545,6 @@ def calculate_acoustics(
 
     )
 
-
-    # No pause is okay for a
-    # short reading sentence.
 
     pause_score = _range_score(
 
@@ -1982,7 +2664,9 @@ def calculate_acoustics(
                 round_or_none(
                     pause_score
                 ),
+
         },
+
     }
 
 
@@ -2024,6 +2708,7 @@ def get_vosk_model() -> Any:
                 SetLogLevel,
             )
 
+
         except ImportError as exc:
 
             raise RuntimeError(
@@ -2041,8 +2726,8 @@ def get_vosk_model() -> Any:
 
                 f"Vosk model not found "
                 f"at {MODEL_PATH}. "
-                f"The included Dockerfile "
-                f"downloads it automatically."
+                f"The Dockerfile should "
+                f"download it automatically."
 
             )
 
@@ -2069,7 +2754,9 @@ def get_vosk_model() -> Any:
         elapsed = (
 
             time.perf_counter()
+
             -
+
             started
 
         )
@@ -2101,9 +2788,12 @@ def _build_reference_grammar(
 ) -> str | None:
 
     words = (
+
         normalize_text(
             reference_text
-        ).split()
+        )
+        .split()
+
     )
 
 
@@ -2111,9 +2801,6 @@ def _build_reference_grammar(
 
         return None
 
-
-    # Remove duplicates while
-    # preserving order.
 
     unique_words = list(
 
@@ -2123,10 +2810,6 @@ def _build_reference_grammar(
 
     )
 
-
-    # Allow unknown words so the
-    # recognizer is not completely
-    # forced to output reference words.
 
     unique_words.append(
         "[unk]"
@@ -2154,6 +2837,7 @@ def transcribe_vosk(
             KaldiRecognizer,
         )
 
+
     except ImportError as exc:
 
         raise RuntimeError(
@@ -2171,9 +2855,13 @@ def transcribe_vosk(
     grammar = (
 
         _build_reference_grammar(
+
             reference_text
+
             or
+
             ""
+
         )
 
         if constrain_vocabulary
@@ -2226,8 +2914,7 @@ def transcribe_vosk(
     ] = []
 
 
-    # 8000 bytes:
-    # 0.25 seconds of 16kHz PCM16.
+    # 0.25 seconds of PCM16
 
     chunk_bytes = 8000
 
@@ -2265,7 +2952,9 @@ def transcribe_vosk(
             payload = json.loads(
 
                 recognizer.Result()
+
                 or
+
                 "{}"
 
             )
@@ -2305,12 +2994,14 @@ def transcribe_vosk(
                 )
 
 
-    # Final segment
+    # Final speech segment
 
     payload = json.loads(
 
         recognizer.FinalResult()
+
         or
+
         "{}"
 
     )
@@ -2351,7 +3042,7 @@ def transcribe_vosk(
 
 
     # ========================================================
-    # NORMALIZE WORD TIMESTAMPS
+    # WORD TIMESTAMPS
     # ========================================================
 
     normalized_words = []
@@ -2361,6 +3052,7 @@ def transcribe_vosk(
 
         normalized_words.append(
             {
+
                 "word":
                     str(
                         item.get(
@@ -2390,6 +3082,7 @@ def transcribe_vosk(
                         ),
                         4
                     ),
+
             }
         )
 
@@ -2398,7 +3091,8 @@ def transcribe_vosk(
 
         part.strip()
 
-        for part in text_parts
+        for part
+        in text_parts
 
         if part.strip()
 
@@ -2413,7 +3107,9 @@ def transcribe_vosk(
 
         transcript = " ".join(
 
-            item["word"]
+            item[
+                "word"
+            ]
 
             for item
             in normalized_words
@@ -2437,11 +3133,12 @@ def transcribe_vosk(
             bool(
                 grammar
             ),
+
     }
 
 
 # ============================================================
-# COMPLETE ANALYSIS
+# COMPLETE AUDIO ANALYSIS
 # ============================================================
 
 def analyze_wav(
@@ -2456,7 +3153,7 @@ def analyze_wav(
 
 
     # ========================================================
-    # LOAD
+    # LOAD AUDIO
     # ========================================================
 
     load_start = (
@@ -2476,7 +3173,9 @@ def analyze_wav(
     load_ms = (
 
         time.perf_counter()
+
         -
+
         load_start
 
     ) * 1000
@@ -2503,7 +3202,9 @@ def analyze_wav(
     prosody_ms = (
 
         time.perf_counter()
+
         -
+
         prosody_start
 
     ) * 1000
@@ -2532,7 +3233,9 @@ def analyze_wav(
     asr_ms = (
 
         time.perf_counter()
+
         -
+
         asr_start
 
     ) * 1000
@@ -2550,41 +3253,6 @@ def analyze_wav(
         normalize_text(
             spoken_text
         ).split()
-
-    )
-
-
-    # ========================================================
-    # SPEED
-    # ========================================================
-
-    speed = calculate_speed(
-
-        recognized_word_count,
-
-        float(
-
-            acoustics[
-                "duration_seconds"
-            ]
-
-            or
-
-            duration
-
-        ),
-
-        float(
-
-            acoustics[
-                "active_speech_seconds"
-            ]
-
-            or
-
-            duration
-
-        ),
 
     )
 
@@ -2617,10 +3285,75 @@ def analyze_wav(
         )
 
 
+    # ========================================================
+    # CORRECT WORD COUNT
+    # ========================================================
+
+    if accuracy is not None:
+
+        correct_word_count = int(
+
+            accuracy[
+                "correct"
+            ]
+
+        )
+
+
+    else:
+
+        correct_word_count = (
+            recognized_word_count
+        )
+
+
+    # ========================================================
+    # SPEED
+    # ========================================================
+
+    speed = calculate_speed(
+
+        recognized_word_count=
+            recognized_word_count,
+
+        correct_word_count=
+            correct_word_count,
+
+        total_seconds=
+            float(
+
+                acoustics[
+                    "duration_seconds"
+                ]
+
+                or
+
+                duration
+
+            ),
+
+        active_speech_seconds=
+            float(
+
+                acoustics[
+                    "active_speech_seconds"
+                ]
+
+                or
+
+                duration
+
+            ),
+
+    )
+
+
     total_ms = (
 
         time.perf_counter()
+
         -
+
         total_start
 
     ) * 1000
@@ -2692,32 +3425,40 @@ def analyze_wav(
                 round(
                     total_ms
                 ),
+
         },
 
         "notes": {
 
             "accuracy":
+                (
+                    "Word-level reading accuracy "
+                    "based on Vosk transcription "
+                    "vs reference_text; not "
+                    "phoneme-level pronunciation scoring."
+                ),
 
-                "Word-level reading accuracy "
-                "based on Vosk transcription "
-                "vs reference_text; not "
-                "phoneme-level pronunciation "
-                "scoring.",
+            "speed":
+                (
+                    "speed_score uses correct words "
+                    "per minute (WCPM). "
+                    "Use grade-appropriate WPM targets."
+                ),
 
             "prosody":
-
-                "Lightweight heuristic from "
-                "pitch variation, energy "
-                "variation and pauses; "
-                "no Librosa/PyTorch model "
-                "is used.",
+                (
+                    "Lightweight heuristic from "
+                    "pitch variation, energy variation "
+                    "and pauses."
+                ),
 
             "constrained_vocabulary":
-
                 transcript[
                     "constrained_vocabulary"
                 ],
+
         },
+
     }
 
 
@@ -2736,11 +3477,12 @@ async def lifespan(
             get_vosk_model
         )
 
+
     yield
 
 
 # ============================================================
-# FASTAPI
+# FASTAPI APP
 # ============================================================
 
 app = FastAPI(
@@ -2749,7 +3491,7 @@ app = FastAPI(
         APP_NAME,
 
     version=
-        "2.0.0",
+        "3.0.0",
 
     lifespan=
         lifespan
@@ -2800,7 +3542,7 @@ app.add_middleware(
 
 
 # ============================================================
-# UPLOAD
+# FILE UPLOAD
 # ============================================================
 
 async def save_upload_limited(
@@ -2811,9 +3553,13 @@ async def save_upload_limited(
     max_bytes = int(
 
         MAX_UPLOAD_MB
+
         *
+
         1024
+
         *
+
         1024
 
     )
@@ -2826,12 +3572,15 @@ async def save_upload_limited(
         "wb"
     ) as output_file:
 
+
         while True:
 
             chunk = await upload.read(
+
                 1024
                 *
                 1024
+
             )
 
 
@@ -2858,6 +3607,7 @@ async def save_upload_limited(
                         f"MB limit."
 
                     )
+
                 )
 
 
@@ -2896,14 +3646,31 @@ def root() -> dict[str, Any]:
         "status":
             "ok",
 
+        "version":
+            "3.0.0",
+
         "engine":
             "vosk",
 
         "model":
             "vosk-model-small-en-us-0.15",
 
-        "endpoint":
-            "POST /analyze",
+        "endpoints": {
+
+            "analyze":
+                "POST /analyze",
+
+            "calculate_proficiency":
+                "POST /calculate-proficiency",
+
+            "health":
+                "GET /health",
+
+        },
+
+        "proficiency_weights":
+            PROFICIENCY_WEIGHTS,
+
     }
 
 
@@ -2931,11 +3698,66 @@ def health() -> dict[str, Any]:
         "model_loaded":
             _VOSK_MODEL
             is not None,
+
     }
 
 
 # ============================================================
-# ANALYZE
+# CALCULATE PROFICIENCY
+# ============================================================
+#
+# Use this AFTER the comprehension quiz.
+#
+# Example:
+#
+# accuracy=92
+# speed=74
+# prosody=81
+# comprehension=85
+#
+# ============================================================
+
+@app.post("/calculate-proficiency")
+async def calculate_proficiency_endpoint(
+
+    accuracy: float = Form(
+        ...
+    ),
+
+    speed: float = Form(
+        ...
+    ),
+
+    prosody: float = Form(
+        ...
+    ),
+
+    comprehension: float = Form(
+        ...
+    ),
+
+) -> dict[str, Any]:
+
+
+    return calculate_reading_proficiency(
+
+        accuracy=
+            accuracy,
+
+        speed=
+            speed,
+
+        prosody=
+            prosody,
+
+        comprehension=
+            comprehension,
+
+    )
+
+
+# ============================================================
+# ANALYZE READING
 # ============================================================
 
 @app.post("/analyze")
@@ -2950,11 +3772,16 @@ async def analyze_endpoint(
             "FLAC, OGG, OPUS, "
             "WebM, MP4, etc."
         )
+
     ),
 
+
     reference_text: str | None = Form(
+
         default=None
+
     ),
+
 
     constrain_vocabulary: bool = Form(
 
@@ -2963,13 +3790,28 @@ async def analyze_endpoint(
         description=(
             "Optional. Restrict Vosk "
             "to expected words. "
-            "Can improve recognition, "
+            "Can improve recognition "
             "but may inflate accuracy."
         )
 
     ),
 
+
+    comprehension_score: float | None = Form(
+
+        default=None,
+
+        description=(
+            "Optional comprehension score "
+            "from 0-100. "
+            "If omitted, reading proficiency "
+            "waits for the comprehension activity."
+        )
+
+    ),
+
 ) -> dict[str, Any]:
+
 
     request_start = (
         time.perf_counter()
@@ -3051,7 +3893,7 @@ async def analyze_endpoint(
 
 
             # =================================================
-            # FFMPEG
+            # CONVERT AUDIO
             # =================================================
 
             conversion_start = (
@@ -3073,14 +3915,16 @@ async def analyze_endpoint(
             conversion_ms = (
 
                 time.perf_counter()
+
                 -
+
                 conversion_start
 
             ) * 1000
 
 
             # =================================================
-            # ANALYZE
+            # ANALYZE AUDIO
             # =================================================
 
             result = await run_in_threadpool(
@@ -3096,16 +3940,107 @@ async def analyze_endpoint(
             )
 
 
+            # =================================================
+            # GET COMPONENT SCORES
+            # =================================================
+
+            accuracy_score = (
+
+                (
+                    result.get(
+                        "accuracy"
+                    )
+
+                    or
+
+                    {}
+
+                )
+
+                .get(
+                    "accuracy_score"
+                )
+
+            )
+
+
+            speed_score = (
+
+                (
+                    result.get(
+                        "speed"
+                    )
+
+                    or
+
+                    {}
+
+                )
+
+                .get(
+                    "speed_score"
+                )
+
+            )
+
+
+            prosody_score = (
+
+                (
+                    result.get(
+                        "prosody"
+                    )
+
+                    or
+
+                    {}
+
+                )
+
+                .get(
+                    "prosody_score"
+                )
+
+            )
+
+
+            # =================================================
+            # CALCULATE READING PROFICIENCY
+            # =================================================
+
+            result[
+                "reading_proficiency"
+            ] = calculate_reading_proficiency(
+
+                accuracy=
+                    accuracy_score,
+
+                speed=
+                    speed_score,
+
+                prosody=
+                    prosody_score,
+
+                comprehension=
+                    comprehension_score,
+
+            )
+
+
+            # =================================================
+            # TOTAL SERVER TIMING
+            # =================================================
+
             request_ms = (
 
                 time.perf_counter()
+
                 -
+
                 request_start
 
             ) * 1000
 
-
-            # Add conversion timing
 
             result[
                 "timing"
@@ -3125,7 +4060,9 @@ async def analyze_endpoint(
             )
 
 
-            # Input info
+            # =================================================
+            # INPUT INFORMATION
+            # =================================================
 
             result[
                 "input"
@@ -3138,8 +4075,16 @@ async def analyze_endpoint(
                     file.content_type,
 
                 "normalized_format":
-                    "wav/pcm_s16le/"
-                    "mono/16000Hz",
+                    (
+                        "wav/pcm_s16le/"
+                        "mono/16000Hz"
+                    ),
+
+                "comprehension_score":
+                    round_or_none(
+                        comprehension_score
+                    ),
+
             }
 
 
@@ -3199,8 +4144,10 @@ async def analyze_endpoint(
 
             detail=(
 
-                f"Analysis failed: "
+                "Analysis failed: "
+
                 f"{type(exc).__name__}: "
+
                 f"{exc}"
 
             )
