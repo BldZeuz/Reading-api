@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import hmac
 import math
 import os
 import re
@@ -14,16 +13,14 @@ import wave
 
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import numpy as np
 
 from fastapi import (
-    Depends,
     FastAPI,
     File,
     Form,
-    Header,
     HTTPException,
     UploadFile,
 )
@@ -37,8 +34,6 @@ from starlette.concurrency import run_in_threadpool
 # ============================================================
 
 APP_NAME = "Vosk Reading Analysis API"
-
-APP_VERSION = "4.0.0"
 
 SAMPLE_RATE = 16_000
 
@@ -62,30 +57,35 @@ MAX_UPLOAD_MB = float(
 MAX_AUDIO_SECONDS = float(
     os.getenv(
         "MAX_AUDIO_SECONDS",
-        "120"
+        "60"
     )
 )
 
 
-APP_API_KEY = os.getenv("APP_API_KEY", "").strip()
+# IMPORTANT:
+#
+# These should eventually be changed depending on:
+# - Grade level
+# - Quarter / school period
+# - Passage difficulty
+#
+# Do NOT assume 110-180 WPM is appropriate
+# for every Grade 1-3 learner.
+
+TARGET_WPM_MIN = float(
+    os.getenv(
+        "TARGET_WPM_MIN",
+        "110"
+    )
+)
 
 
-def optional_float_env(name: str) -> float | None:
-
-    raw_value = os.getenv(name, "").strip()
-
-    if not raw_value:
-
-        return None
-
-    return float(raw_value)
-
-
-# Optional compatibility settings only. There is deliberately no default
-# WCPM target: a single 110-180 range is not valid for every Grade 1-3 learner,
-# every assessment period, or every kind of generated reading task.
-TARGET_WPM_MIN = optional_float_env("TARGET_WPM_MIN")
-TARGET_WPM_MAX = optional_float_env("TARGET_WPM_MAX")
+TARGET_WPM_MAX = float(
+    os.getenv(
+        "TARGET_WPM_MAX",
+        "180"
+    )
+)
 
 
 PRELOAD_MODEL = (
@@ -99,61 +99,6 @@ PRELOAD_MODEL = (
         "no"
     }
 )
-
-
-# ============================================================
-# GENERATOR / MEASUREMENT CONTRACT
-# ============================================================
-
-Difficulty = Literal["easy", "medium", "hard"]
-MeasurementProfile = Literal[
-    "oral_word_accuracy",
-    "oral_passage_fluency",
-    "recording_only",
-]
-
-MATATAG_SUBDOMAINS = {
-    "Phonological Awareness",
-    "Phonics and Word Study",
-    "Vocabulary and Word Knowledge",
-    "Book and Print Knowledge",
-    "Comprehending and Analyzing Text",
-}
-
-SUBDOMAINS_BY_GRADE = {
-    1: MATATAG_SUBDOMAINS,
-    2: MATATAG_SUBDOMAINS - {"Book and Print Knowledge"},
-    3: MATATAG_SUBDOMAINS
-    - {"Book and Print Knowledge", "Phonological Awareness"},
-}
-
-# These names include the v4 generator values and aliases emitted by the old
-# bundle generator. Non-speech activities must be scored by the application
-# backend instead of being sent to this service.
-ACTIVITY_PROFILE_MAP: dict[str, MeasurementProfile] = {
-    "phonics": "oral_word_accuracy",
-    "phonics_reading": "oral_word_accuracy",
-    "sight_words": "oral_word_accuracy",
-    "sight_word_reading": "oral_word_accuracy",
-    "word_reading": "oral_word_accuracy",
-    "oral_reading": "oral_passage_fluency",
-    "sentence_reading": "oral_passage_fluency",
-    "passage_reading": "oral_passage_fluency",
-    "timed_reading": "oral_passage_fluency",
-    "repeated_reading": "oral_passage_fluency",
-    "reading_comprehension": "oral_passage_fluency",
-}
-
-NON_SPEECH_ACTIVITY_TYPES = {
-    "rhyming",
-    "multiple_choice",
-    "true_false",
-    "fill_in_blank",
-    "word_matching",
-    "word_sorting",
-    "vocabulary",
-    "sequencing",
-}
 
 
 # ============================================================
@@ -218,136 +163,6 @@ def round_or_none(
         float(value),
         digits
     )
-
-
-def require_internal_key(
-    x_app_key: str | None = Header(default=None),
-) -> None:
-
-    """Protect analysis routes when APP_API_KEY is configured.
-
-    Local development remains usable without a key. Production should always
-    configure APP_API_KEY and have the PHP backend send X-App-Key.
-    """
-
-    if not APP_API_KEY:
-
-        return
-
-    if x_app_key is None or not hmac.compare_digest(x_app_key, APP_API_KEY):
-
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or missing X-App-Key.",
-        )
-
-
-def canonical_subdomain(value: str) -> str | None:
-
-    cleaned = " ".join(value.split()).casefold()
-
-    for subdomain in MATATAG_SUBDOMAINS:
-
-        if subdomain.casefold() == cleaned:
-
-            return subdomain
-
-    return None
-
-
-def resolve_measurement_profile(
-    activity_type: str,
-) -> MeasurementProfile:
-
-    normalized = activity_type.strip().casefold()
-
-    if normalized in NON_SPEECH_ACTIVITY_TYPES:
-
-        raise ValueError(
-            f"Activity type '{activity_type}' is not speech-scored. "
-            "Score it in the application backend instead."
-        )
-
-    profile = ACTIVITY_PROFILE_MAP.get(normalized)
-
-    if profile is None:
-
-        raise ValueError(f"Unsupported activity_type: {activity_type}")
-
-    return profile
-
-
-def validate_activity_context(
-    *,
-    grade: int,
-    subdomain: str,
-    competency_code: str,
-    activity_type: str,
-    difficulty: str,
-    reference_text: str | None,
-) -> tuple[str, str, Difficulty, MeasurementProfile]:
-
-    if grade not in {1, 2, 3}:
-
-        raise ValueError("grade must be 1, 2, or 3")
-
-    canonical = canonical_subdomain(subdomain)
-
-    if canonical is None:
-
-        raise ValueError(f"Unknown MATATAG subdomain: {subdomain}")
-
-    if canonical not in SUBDOMAINS_BY_GRADE[grade]:
-
-        raise ValueError(
-            f"Subdomain '{canonical}' is not available for Grade {grade}."
-        )
-
-    code = competency_code.strip().upper()
-
-    if not code:
-
-        raise ValueError("competency_code is required")
-
-    normalized_difficulty = difficulty.strip().casefold()
-
-    if normalized_difficulty not in {"easy", "medium", "hard"}:
-
-        raise ValueError("difficulty must be easy, medium, or hard")
-
-    profile = resolve_measurement_profile(activity_type)
-
-    if not reference_text or not normalize_text(reference_text):
-
-        raise ValueError(
-            "reference_text is required for speech-scored activities"
-        )
-
-    return (
-        canonical,
-        code,
-        normalized_difficulty,
-        profile,
-    )
-
-
-def eligible_metrics_for_profile(
-    profile: MeasurementProfile,
-) -> list[str]:
-
-    if profile == "oral_word_accuracy":
-
-        return ["word_accuracy"]
-
-    if profile == "oral_passage_fluency":
-
-        return [
-            "word_accuracy",
-            "wcpm",
-            "experimental_prosody",
-        ]
-
-    return []
 
 
 # ============================================================
@@ -969,42 +784,48 @@ def calculate_speed(
     )
 
 
-    score: float | None = None
-    label = "not_interpreted"
-    target_range: list[float] | None = None
+    # IMPORTANT:
+    # speed_score uses correct words/minute.
 
-    # Only calculate the legacy 0-100 speed score when a deployment has
-    # explicitly supplied a locally justified target range. Raw WCPM remains
-    # available in every response.
+    score = _range_score(
+
+        wcpm,
+
+        TARGET_WPM_MIN,
+
+        TARGET_WPM_MAX,
+
+        0.0,
+
+        max(
+            TARGET_WPM_MAX * 1.6,
+            TARGET_WPM_MAX + 60
+        )
+
+    )
+
+
     if (
-        TARGET_WPM_MIN is not None
-        and TARGET_WPM_MAX is not None
-        and TARGET_WPM_MIN < TARGET_WPM_MAX
+        wcpm
+        <
+        TARGET_WPM_MIN
     ):
 
-        score = _range_score(
-            wcpm,
-            TARGET_WPM_MIN,
-            TARGET_WPM_MAX,
-            0.0,
-            max(
-                TARGET_WPM_MAX * 1.6,
-                TARGET_WPM_MAX + 60,
-            ),
-        )
-        target_range = [TARGET_WPM_MIN, TARGET_WPM_MAX]
+        label = "slow"
 
-        if wcpm < TARGET_WPM_MIN:
 
-            label = "below_configured_range"
+    elif (
+        wcpm
+        >
+        TARGET_WPM_MAX
+    ):
 
-        elif wcpm > TARGET_WPM_MAX:
+        label = "fast"
 
-            label = "above_configured_range"
 
-        else:
+    else:
 
-            label = "within_configured_range"
+        label = "good"
 
 
     return {
@@ -1042,14 +863,20 @@ def calculate_speed(
         "pace_label":
             label,
 
-        "target_wpm_range":
-            target_range,
+        "target_wpm_range": [
+
+            TARGET_WPM_MIN,
+
+            TARGET_WPM_MAX
+
+        ],
 
         "note":
             (
-                "WCPM is a raw measurement. speed_score and pace_label "
-                "are interpreted only when a locally validated target "
-                "range is explicitly configured."
+                "speed_score is based on WCPM "
+                "(correct words per minute). "
+                "Use grade-appropriate "
+                "TARGET_WPM_MIN/TARGET_WPM_MAX values."
             ),
 
     }
@@ -2194,8 +2021,7 @@ def _estimate_pitch_hz(
 
 def calculate_acoustics(
     audio: np.ndarray,
-    sr: int = SAMPLE_RATE,
-    include_prosody: bool = True,
+    sr: int = SAMPLE_RATE
 ) -> dict[str, Any]:
 
     total_seconds = (
@@ -2488,9 +2314,11 @@ def calculate_acoustics(
 
 
     candidate_starts = (
-        starts[speech_mask]
-        if include_prosody
-        else np.asarray([], dtype=np.int64)
+
+        starts[
+            speech_mask
+        ]
+
     )
 
 
@@ -2688,41 +2516,70 @@ def calculate_acoustics(
     # PROSODY SCORE
     # ========================================================
 
-    if include_prosody:
+    pitch_score = _range_score(
 
-        pitch_score = _range_score(
-            pitch_cv,
-            0.05,
-            0.30,
-            0.0,
-            0.60,
-        )
-        energy_score = _range_score(
-            energy_cv,
-            0.10,
-            0.55,
-            0.0,
-            1.10,
-        )
-        pause_score = _range_score(
-            pause_ratio,
-            0.0,
-            0.22,
-            0.0,
-            0.55,
-        )
-        prosody_score: float | None = (
-            0.45 * pitch_score
-            + 0.30 * energy_score
-            + 0.25 * pause_score
-        )
+        pitch_cv,
 
-    else:
+        0.05,
 
-        pitch_score = None
-        energy_score = None
-        pause_score = None
-        prosody_score = None
+        0.30,
+
+        0.0,
+
+        0.60
+
+    )
+
+
+    energy_score = _range_score(
+
+        energy_cv,
+
+        0.10,
+
+        0.55,
+
+        0.0,
+
+        1.10
+
+    )
+
+
+    pause_score = _range_score(
+
+        pause_ratio,
+
+        0.0,
+
+        0.22,
+
+        0.0,
+
+        0.55
+
+    )
+
+
+    prosody_score = (
+
+        0.45
+        *
+        pitch_score
+
+        +
+
+        0.30
+        *
+        energy_score
+
+        +
+
+        0.25
+        *
+        pause_score
+
+    )
 
 
     return {
@@ -2786,23 +2643,9 @@ def calculate_acoustics(
 
         "prosody_score":
             round_or_none(
-                clamp(prosody_score)
-                if prosody_score is not None
-                else None
-            ),
-
-        "experimental_prosody_indicator":
-            round_or_none(
-                clamp(prosody_score)
-                if prosody_score is not None
-                else None
-            ),
-
-        "interpretation_status":
-            (
-                "experimental_not_calibrated"
-                if include_prosody
-                else "not_applicable_for_measurement_profile"
+                clamp(
+                    prosody_score
+                )
             ),
 
         "prosody_components": {
@@ -3301,8 +3144,7 @@ def transcribe_vosk(
 def analyze_wav(
     wav_path: str | Path,
     reference_text: str | None = None,
-    constrain_vocabulary: bool = False,
-    measurement_profile: MeasurementProfile = "oral_passage_fluency",
+    constrain_vocabulary: bool = False
 ) -> dict[str, Any]:
 
     total_start = (
@@ -3352,11 +3194,7 @@ def analyze_wav(
 
         audio,
 
-        SAMPLE_RATE,
-
-        include_prosody=(
-            measurement_profile == "oral_passage_fluency"
-        ),
+        SAMPLE_RATE
 
     )
 
@@ -3602,9 +3440,9 @@ def analyze_wav(
 
             "speed":
                 (
-                    "WCPM is reported as a raw measurement. "
-                    "No grade interpretation is applied unless validated "
-                    "targets are explicitly configured."
+                    "speed_score uses correct words "
+                    "per minute (WCPM). "
+                    "Use grade-appropriate WPM targets."
                 ),
 
             "prosody":
@@ -3622,124 +3460,6 @@ def analyze_wav(
         },
 
     }
-
-
-def build_quality_flags(
-    result: dict[str, Any],
-) -> list[str]:
-
-    flags: list[str] = []
-    word_timestamps = result.get("word_timestamps") or []
-    confidences = [
-        float(item["confidence"])
-        for item in word_timestamps
-        if item.get("confidence") is not None
-    ]
-
-    if not normalize_text(str(result.get("transcript") or "")):
-
-        flags.append("no_recognized_speech")
-
-    if confidences and sum(confidences) / len(confidences) < 0.65:
-
-        flags.append("low_asr_confidence")
-
-    prosody = result.get("prosody") or {}
-    duration = float(prosody.get("duration_seconds") or 0.0)
-    active = float(prosody.get("active_speech_seconds") or 0.0)
-
-    if duration < 1.0:
-
-        flags.append("very_short_recording")
-
-    if duration > 0 and active / duration < 0.35:
-
-        flags.append("low_active_speech_ratio")
-
-    if (result.get("notes") or {}).get("constrained_vocabulary"):
-
-        flags.append("constrained_vocabulary_may_inflate_accuracy")
-
-    return flags
-
-
-def build_aligned_response(
-    *,
-    result: dict[str, Any],
-    activity_id: str | None,
-    grade: int,
-    subdomain: str,
-    competency_code: str,
-    activity_type: str,
-    difficulty: Difficulty,
-    attempt_number: int,
-    profile: MeasurementProfile,
-    comprehension_score: float | None,
-    legacy_proficiency: bool,
-) -> dict[str, Any]:
-
-    accuracy = result.get("accuracy") or {}
-    speed = result.get("speed") or {}
-    prosody = result.get("prosody") or {}
-
-    measurements: dict[str, Any] = {
-        "word_accuracy_percent": accuracy.get("accuracy_score"),
-        "correct_words": accuracy.get("correct"),
-        "substitutions": accuracy.get("substitutions"),
-        "deletions": accuracy.get("deletions"),
-        "insertions": accuracy.get("insertions"),
-        "wcpm": None,
-        "experimental_prosody_indicator": None,
-        "comprehension_score": round_or_none(comprehension_score),
-    }
-
-    if profile == "oral_passage_fluency":
-
-        measurements["wcpm"] = speed.get("wcpm")
-        measurements["experimental_prosody_indicator"] = prosody.get(
-            "experimental_prosody_indicator"
-        )
-
-    if legacy_proficiency:
-
-        proficiency = calculate_reading_proficiency(
-            accuracy=accuracy.get("accuracy_score"),
-            speed=speed.get("speed_score"),
-            prosody=prosody.get("prosody_score"),
-            comprehension=comprehension_score,
-        )
-
-    else:
-
-        proficiency = {
-            "status": "not_calculated",
-            "overall_score": None,
-            "level": None,
-            "message": (
-                "Overall proficiency is owned by the adaptive recommender. "
-                "Set legacy_proficiency=true only during migration."
-            ),
-        }
-
-    result["activity_context"] = {
-        "activity_id": activity_id,
-        "grade": grade,
-        "subdomain": subdomain,
-        "competency_code": competency_code,
-        "activity_type": activity_type.strip().casefold(),
-        "difficulty": difficulty,
-        "attempt_number": attempt_number,
-    }
-    result["measurement_profile"] = profile
-    result["eligible_metrics"] = eligible_metrics_for_profile(profile)
-    result["measurements"] = measurements
-    result["quality_flags"] = build_quality_flags(result)
-    result["api_version"] = APP_VERSION
-    result["scoring_profile_version"] = "reading-v4.0"
-    result["assessment_use"] = "formative_practice_not_official_classification"
-    result["reading_proficiency"] = proficiency
-
-    return result
 
 
 # ============================================================
@@ -3771,7 +3491,7 @@ app = FastAPI(
         APP_NAME,
 
     version=
-        APP_VERSION,
+        "3.0.0",
 
     lifespan=
         lifespan
@@ -3927,7 +3647,7 @@ def root() -> dict[str, Any]:
             "ok",
 
         "version":
-            APP_VERSION,
+            "3.0.0",
 
         "engine":
             "vosk",
@@ -3941,46 +3661,16 @@ def root() -> dict[str, Any]:
                 "POST /analyze",
 
             "calculate_proficiency":
-                "POST /calculate-proficiency (legacy)",
+                "POST /calculate-proficiency",
 
             "health":
                 "GET /health",
 
         },
 
-        "workflow":
-            (
-                "Generator tags -> activity-specific oral measurements -> "
-                "backend attempt record -> adaptive recommender"
-            ),
+        "proficiency_weights":
+            PROFICIENCY_WEIGHTS,
 
-        "security":
-            "x_app_key_required" if APP_API_KEY else "open_local_mode",
-
-    }
-
-
-@app.get("/metadata")
-def metadata() -> dict[str, Any]:
-
-    return {
-        "version": APP_VERSION,
-        "grades": [1, 2, 3],
-        "subdomains_by_grade": {
-            str(grade): sorted(subdomains)
-            for grade, subdomains in SUBDOMAINS_BY_GRADE.items()
-        },
-        "speech_activity_types": sorted(ACTIVITY_PROFILE_MAP),
-        "non_speech_activity_types": sorted(NON_SPEECH_ACTIVITY_TYPES),
-        "measurement_profiles": {
-            activity_type: profile
-            for activity_type, profile in sorted(ACTIVITY_PROFILE_MAP.items())
-        },
-        "difficulty_levels": ["easy", "medium", "hard"],
-        "policy": (
-            "Difficulty is activity demand metadata. It does not alter raw "
-            "accuracy or WCPM formulas."
-        ),
     }
 
 
@@ -3996,9 +3686,6 @@ def health() -> dict[str, Any]:
         "status":
             "ok",
 
-        "version":
-            APP_VERSION,
-
         "ffmpeg":
             shutil.which(
                 "ffmpeg"
@@ -4011,13 +3698,6 @@ def health() -> dict[str, Any]:
         "model_loaded":
             _VOSK_MODEL
             is not None,
-
-        "api_key_configured":
-            bool(APP_API_KEY),
-
-        "wcpm_target_configured":
-            TARGET_WPM_MIN is not None
-            and TARGET_WPM_MAX is not None,
 
     }
 
@@ -4056,14 +3736,10 @@ async def calculate_proficiency_endpoint(
         ...
     ),
 
-    _authorized: None = Depends(
-        require_internal_key
-    ),
-
 ) -> dict[str, Any]:
 
 
-    result = calculate_reading_proficiency(
+    return calculate_reading_proficiency(
 
         accuracy=
             accuracy,
@@ -4078,14 +3754,6 @@ async def calculate_proficiency_endpoint(
             comprehension,
 
     )
-
-    result["deprecated"] = True
-    result["message"] = (
-        "Legacy application heuristic. New clients should send raw attempt "
-        "measurements to the adaptive recommender."
-    )
-
-    return result
 
 
 # ============================================================
@@ -4108,51 +3776,9 @@ async def analyze_endpoint(
     ),
 
 
-    grade: int = Form(
-        ...,
-        description="Generator grade tag: 1, 2, or 3."
-    ),
+    reference_text: str | None = Form(
 
-
-    subdomain: str = Form(
-        ...,
-        description="Exact MATATAG reading subdomain from the generator."
-    ),
-
-
-    competency_code: str = Form(
-        ...,
-        description="Exact competency code selected during generation."
-    ),
-
-
-    activity_type: str = Form(
-        ...,
-        description="Speech-ready generator activity type."
-    ),
-
-
-    difficulty: str = Form(
-        ...,
-        description="Selected generator difficulty: easy, medium, or hard."
-    ),
-
-
-    activity_id: str | None = Form(
         default=None
-    ),
-
-
-    attempt_number: int = Form(
-        default=1,
-        ge=1
-    ),
-
-
-    reference_text: str = Form(
-
-        ...,
-        description="Exact text shown to the learner for oral reading."
 
     ),
 
@@ -4176,58 +3802,15 @@ async def analyze_endpoint(
         default=None,
 
         description=(
-            "Optional 0-100 score calculated by the application backend. "
-            "This service does not derive comprehension from audio."
+            "Optional comprehension score "
+            "from 0-100. "
+            "If omitted, reading proficiency "
+            "waits for the comprehension activity."
         )
 
-    ),
-
-
-    legacy_proficiency: bool = Form(
-        default=False,
-        description=(
-            "Migration flag only. Enables the old fixed-weight proficiency "
-            "heuristic when all legacy components are available."
-        )
-    ),
-
-
-    _authorized: None = Depends(
-        require_internal_key
     ),
 
 ) -> dict[str, Any]:
-
-
-    try:
-
-        (
-            canonical_domain,
-            canonical_code,
-            canonical_difficulty,
-            measurement_profile,
-        ) = validate_activity_context(
-            grade=grade,
-            subdomain=subdomain,
-            competency_code=competency_code,
-            activity_type=activity_type,
-            difficulty=difficulty,
-            reference_text=reference_text,
-        )
-
-    except ValueError as exc:
-
-        raise HTTPException(
-            status_code=422,
-            detail=str(exc),
-        ) from exc
-
-    if comprehension_score is not None and not 0 <= comprehension_score <= 100:
-
-        raise HTTPException(
-            status_code=422,
-            detail="comprehension_score must be between 0 and 100",
-        )
 
 
     request_start = (
@@ -4352,9 +3935,94 @@ async def analyze_endpoint(
 
                 reference_text,
 
-                constrain_vocabulary,
+                constrain_vocabulary
 
-                measurement_profile,
+            )
+
+
+            # =================================================
+            # GET COMPONENT SCORES
+            # =================================================
+
+            accuracy_score = (
+
+                (
+                    result.get(
+                        "accuracy"
+                    )
+
+                    or
+
+                    {}
+
+                )
+
+                .get(
+                    "accuracy_score"
+                )
+
+            )
+
+
+            speed_score = (
+
+                (
+                    result.get(
+                        "speed"
+                    )
+
+                    or
+
+                    {}
+
+                )
+
+                .get(
+                    "speed_score"
+                )
+
+            )
+
+
+            prosody_score = (
+
+                (
+                    result.get(
+                        "prosody"
+                    )
+
+                    or
+
+                    {}
+
+                )
+
+                .get(
+                    "prosody_score"
+                )
+
+            )
+
+
+            # =================================================
+            # CALCULATE READING PROFICIENCY
+            # =================================================
+
+            result[
+                "reading_proficiency"
+            ] = calculate_reading_proficiency(
+
+                accuracy=
+                    accuracy_score,
+
+                speed=
+                    speed_score,
+
+                prosody=
+                    prosody_score,
+
+                comprehension=
+                    comprehension_score,
 
             )
 
@@ -4417,25 +4085,10 @@ async def analyze_endpoint(
                         comprehension_score
                     ),
 
-                "legacy_proficiency_requested":
-                    legacy_proficiency,
-
             }
 
 
-            return build_aligned_response(
-                result=result,
-                activity_id=activity_id,
-                grade=grade,
-                subdomain=canonical_domain,
-                competency_code=canonical_code,
-                activity_type=activity_type,
-                difficulty=canonical_difficulty,
-                attempt_number=attempt_number,
-                profile=measurement_profile,
-                comprehension_score=comprehension_score,
-                legacy_proficiency=legacy_proficiency,
-            )
+            return result
 
 
     except HTTPException:
